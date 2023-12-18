@@ -16,6 +16,6 @@ This script is for producing all the plots and statistical analyses in "Seasonal
 
 :exclamation: These files are optimized for the studied environmental system and are dependant on metadata of the system. The scripts are meant for replication of the following published study: <https://doi.org/10.1093/femsec/fiad162>
 
-:dna: The original sequencing data will be archived at the European Nucleotide Archive. The processed table (output of ReadAmplicon.R) have been made available on Dataverse (<https://doi.org/10.18710/JDWLVA>).
+:dna: The original sequencing data will be archived at the European Nucleotide Archive. The processed tables (output of Manuscript_Script_Cleaned.Rmd and Plate_Processing_Cleaned.Rmd) will be made available on Dataverse.
 
 :question: Please let me know if you encounter any problems or have any questions.
