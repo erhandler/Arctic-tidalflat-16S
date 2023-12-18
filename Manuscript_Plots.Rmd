@@ -1,0 +1,2367 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+library(vegan)
+library(lubridate)
+library(cowplot)
+library(ggh4x)
+library(dendextend)
+library(pryr)
+library(ggtext)
+library(dunn.test)
+library(broom)
+library(phyloseq)
+library(microbiome)
+library(readxl)
+```
+
+
+Set working directory
+```{r}
+setwd("~/Desktop/Desktop/Norway/Research/Thesis_Data")
+```
+
+# Load in data
+```{r}
+ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool <- readRDS("~/Desktop/Desktop/Norway/Research/Thesis_Data/cleaned_phyloseq_pseudo_pool.rds")
+
+ps_proportions_wspc <- transform(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool, transform = "compositional")
+
+otu_prop <- as.data.frame(otu_table(ps_proportions_wspc)) %>% select(-c(`9-River-extra`))%>% t()
+
+sediment_environmental <- read_csv("~/Desktop/Desktop/Norway/Research/Thesis_Data/Sediment_Environmental_Data.csv") %>% 
+  filter(Site != "extra") %>%  # remove the extra sample from September
+  mutate(Transect = factor(Transect, levels = c("Fjord", "Subtidal", "Intertidal", "River")),
+         Month = factor(Month, levels = c("May", "June", "July", "August", "September")))
+
+grain_size_long <- read_csv("~/Desktop/Desktop/Norway/Research/Thesis_Data/grain_size_long.csv") %>% 
+  filter(Site != "extra") %>% # remove the extra sample from September 
+  select(-c(Number, "Bottle number", "Dry weight with bottle (g)", Type, Comments, "Bottle weight (g)")) %>% 
+  mutate(Transect = factor(Transect, levels = c("Fjord", "Subtidal", "Intertidal", "River")), 
+         Month = factor(Month, levels = c("May", "June", "July", "August", "September")), 
+         `Size Fraction` = factor(`Size Fraction`, levels = c(">2mm (Gravel)", "1-2mm (Very coarse sand)", "500µm-1mm (Coarse sand)", "250-500µm (Medium sand)", "125-250µm (Fine sand)", "63-125µm (Very fine sand)", "<63µm (Silt and clay)")))
+
+adjacent_water_enviro <- read_csv("~/Desktop/Desktop/Norway/Research/Thesis_Data/adjacent_water_enviro.csv") %>% 
+  mutate(Transect = factor(Transect, levels = c("Fjord", "Subtidal", "Intertidal", "River")), 
+         Month = factor(Month, levels = c("May", "June", "July", "August", "September"))) %>% 
+  filter(Station %in% c("River", "SeawaterLab"))
+
+tidal_info <- read_excel("Tidal_info.xlsx", col_types = c("text", "text", "text",  "skip", "skip", "skip", "skip", "numeric", "text")) %>% 
+  mutate(Date = dmy(Date))
+
+sediment_environmental <- sediment_environmental %>% full_join(tidal_info) %>% 
+    mutate(Transect = factor(Transect, levels = c("Fjord", "Subtidal", "Intertidal", "River")))
+
+
+```
+
+
+```{r}
+### Need a dataframe with simple metadata for coloring, grouping etc. 
+samples <- data.frame(Sample = rownames(otu_prop), 
+                      Month = as.numeric(str_sub(rownames(otu_prop),1,1)), 
+                      Station = str_sub(rownames(otu_prop), 3,7)) %>% 
+  mutate(Month_n = factor(month.name[Month], levels=c("May", "June", "July", "August", "September")),
+         Transect = factor(Station, levels = c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River"))) %>%  
+  mutate(Transect_month = paste(Transect, Month_n, sep=""),
+                              Site = str_sub(Sample,9,9),
+                              Clade = ifelse(Transect == "River", "River", "Intertidal"), 
+                              Clade = ifelse(Transect == "Fjord" & (Month %in% c(6,7)), "Post-Bloom", Clade), 
+                              Clade = ifelse(Transect %in% c("Fjord", "Subtidal") & (Month %in% c(8,9)), "Late-Marine", Clade), 
+                              Clade = ifelse(Month == 5 | Transect_month == "SubtidalJune", "Pre-Melt", Clade)) %>% 
+  mutate(Cluster = factor(Clade, levels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "Intertidal", "River"),  labels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "Melt-Influenced", "Riverine")))
+
+myCol <- c("#018571", "#80CDC1", "#DFC27D", "#A6611A")
+```
+
+# Plotting Environmental Data
+
+## PCA with Environmental Data
+```{r}
+enviro_for_PCA <- sediment_environmental %>% 
+  filter(Sample_Code != "9.R.extra", Sample_Code != "7.D.z") %>% 
+  column_to_rownames(var="Sample_Code") %>% drop_na(`>2mm`) %>% 
+  select(where(is.numeric)) %>% #remove highly correlated data
+  select(-c(Sediment_temp, Station_Depth, DOM_a250, DOM_a365, DOM_a375, 
+            PW_Ammonium, PW_Nitrite_Nitrate, 
+            PW_Phosphate, PW_Silicate,
+            `250-500µm`, `500µm-1mm`, `1-2mm`, `>2mm`,
+            `63-250µm`, Bulk_density, 
+            Phaeo, DOM_Slope275_295, 
+            DOM_SR)) %>% drop_na()
+
+enviro_for_PCA_t_log <- enviro_for_PCA %>% mutate(across(c(3,5,9:12,16), log)) %>% t()
+
+enviro.pca.veganz <- rda(scale(t(enviro_for_PCA_t_log)))
+summary(enviro.pca.veganz)
+
+plot(enviro.pca.veganz)
+
+scores.PCA <- scores(enviro.pca.veganz, display=c("sites","sp")) # sites, species
+
+PCA.sites <- data.frame(scores.PCA$sites)
+PCA.arrows <- data.frame(scores.PCA$species) %>% 
+  rownames_to_column(var="Variable") %>% # get all enviro variables
+  mutate(Type = ifelse(Variable %in% c(">250µm","125-250µm","63-125µm", 
+                                       "<63µm", "Porosity", "LOI_percent"), "Sediment \nCharacteristics", "Porewater \nChemistry"),
+         Type = ifelse(Variable %in% c("Chla (mg/m3)", "% Phaeo",
+                                       "DOM_a254", "DOM_E2_E3",
+                                       "DOM_Slope350_400"), 
+                       "Indicators of \nOM Quality", Type), 
+         Variable = factor(Variable, levels = c( ">250µm","125-250µm","63-125µm", 
+                                                "<63µm", "Porosity", "LOI_percent",
+                                                "Salinity", "PW_Phosphate_mol",
+                                                "PW_Ammonium_mol", "PW_Silicate_mol", 
+                                                "PW_Nitrite_Nitrate_mol", 
+                                                "Chla (mg/m3)", "% Phaeo", 
+                                                "DOM_a254", "DOM_E2_E3", 
+                                                "DOM_Slope350_400"), 
+                           labels = c(">250µm (%)","125-250µm (%)","63-125µm (%)",
+                                      "<63µm (%)", "Porosity", "Organic Content (%)",
+                                      "PW Salinity (PSU)", "PW Phosphate (µmol/L)",
+                                      "PW Ammonium (µmol/L)", "PW Silicate (µmol/L)",
+                                      "PW Nitrite and Nitrate (µmol/L)", 
+                                      "Chl-a (µg/mL)", "Phaeopigments (%)",
+                                      "PW DOM abs 254nm", "PW DOM E2/E3", 
+                                      "PW DOM Slope 350-400"))) %>% 
+  mutate(labelX = c(1.45,  1.75,  0.6, -0.08, -1.5, -1.45,  1.5,  1.5,  1.8,  1.35, -0.63,  0.71,  1.68, -0.35, 0.05, -0.96), 
+         labelY = c(-0.25,  0.02,  1.04, -1.05,  0.57,  0.09, -0.43,  0.68,  0.5,  0.88, 0.42, -0.6,  0.29,  0.59,  0.85,  0.75))
+
+
+enviro_metadata <- sediment_environmental %>%
+  filter(Sample_Code != "6.S.y", Sample_Code != "6.F.y", Sample_Code != "5.F.y", Sample_Code != "7.D.z") %>%
+  select(Sample_Code, Month, Transect, Site, Date) %>% mutate(Month = month(Date, label = T))
+```
+
+### Plot the PCA with Environmental data (S2)
+```{r}
+plot.PCA.enviro <- ggplot(PCA.sites, aes(x = PC1, y = PC2)) +
+  geom_hline(yintercept=0, linetype="dotted") +
+  geom_vline(xintercept=0, linetype="dotted") +
+  # geom_point(aes(col=factor(enviro_metadata$Transect),
+  #                shape = factor(enviro_metadata$Month)),
+  #            size=3.8) +
+  geom_point(aes(fill = factor(enviro_metadata$Transect),
+                 shape = factor(enviro_metadata$Month)),
+             size = 7, 
+             col="white") +
+  #scale_colour_manual(values = c(myCol)) +
+  scale_fill_manual(values = myCol) +
+  scale_shape_manual(values = c(21,24,22,23,25)) +
+  geom_segment(data = PCA.arrows,
+               aes(x = 0, xend = PC1, y = 0, yend = PC2, 
+                   linetype=factor(Type, levels = unique(Type)[c(1,3,2)])),
+               arrow=arrow(length=unit(0.01,"npc")),
+               color = "black") +
+  geom_label(data = PCA.arrows,
+            aes(x = labelX, y = labelY, label=Variable),
+            size = 4,
+            color = "black",
+            alpha = 0.5) +
+  labs(color = "Station", shape = "Month", fill = "Station", linetype= "Type",
+       x = "PC1 (45.3%)",
+       y = "PC2 (18.7%)",
+       size = 8) +
+  theme_linedraw() +
+  theme(panel.grid = element_blank(),
+        text = element_text(size = 25),
+        legend.background = element_blank(),
+        legend.box.background= element_rect(colour="black"),
+        legend.position = "right", 
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=14)) +
+  guides(linetype = guide_legend(order = 3, keyheight = unit(0.5, "inch")),
+         shape=guide_legend(order=2, override.aes = list(col="black", size=5)), 
+         fill=guide_legend(order=1, override.aes = list(pch=21, size=5))) +
+  coord_fixed() +
+  xlim(-1.7,1.9)
+plot.PCA.enviro
+```
+
+## Grain Size distribution (S3)
+```{r}
+grain_size_long %>% ggplot(aes(Site, Percentage, fill=`Size Fraction`)) + 
+  geom_col(col = "grey18", size=0.01) + 
+  facet_grid(Month ~ Transect) + 
+  scale_fill_brewer(palette = "PuOr", direction = -1) + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), text = element_text(size=20), panel.background =element_rect(fill =  "black"), 
+        axis.text.y = element_text(size=10))
+```
+
+## Sediment Characteristics (S4)
+```{r}
+sed_char_long <- sediment_environmental %>% select(Sample_Code, Transect, Month, `<63µm`, Porosity, LOI_percent, Sediment_temp) %>% 
+  rename(`Organic Content (%)` = LOI_percent,
+         `Silt and Clay Content (%)` = `<63µm`, 
+         `Temperature (ºC)` = Sediment_temp) %>% 
+  pivot_longer(cols = 4:7, names_to = "Variable", values_to = "Value") %>% 
+  mutate(labelooroo = factor(Variable, labels=c("A", "B", "C", "D")))
+
+sed_char_long %>% 
+  ggplot(aes(Transect, Value)) + 
+  geom_boxplot(aes(fill=Transect, color=Transect), alpha=0.4, outlier.shape = NA) +
+  scale_color_manual(values = myCol) +
+  scale_fill_manual(values = myCol) +
+  geom_jitter(aes(pch=Month, fill=Transect), color="grey35", width = 0.05, height=0)+
+  facet_nested(labelooroo + Variable ~., scales = "free_y", switch="y",
+             strip = strip_themed(background_y = list(
+               element_blank(),
+               element_blank()
+             ),
+             text_y = list(
+               element_text(vjust = 1, angle = 0, size = rel(1.3), face = "bold", margin = margin(t = 0, r = 5.5)),
+               element_text(vjust = .5, angle = 90, size = rel(1), margin = margin(4.4, 4.4, 4.4, 4.4))
+             ),
+             by_layer_y = TRUE
+             )) +
+    scale_shape_manual(values = c(21,24,22,23,25), labels = c("May", "June", "July", "Aug", "Sept")) +
+  theme_cowplot() +
+  labs(color="Station", fill="Station", x="Station") +
+  theme(strip.placement = "outside", 
+        axis.title = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.border = element_rect(color="black"), 
+        axis.text.x = element_text(size=10,angle = 45, vjust = 1, hjust=1), 
+        panel.grid.major.y = element_line(color="grey85"), 
+        strip.text.y = element_text(size=11),
+        panel.spacing = unit(1.5, "lines")) +
+  guides(color = guide_legend(override.aes = list(shape = c(NA))))
+```
+
+## Porewater Chemistry (S5)
+```{r}
+porewater_long <- sediment_environmental %>% select(Sample_Code, Transect, Month, Salinity, PW_Ammonium_mol, PW_Phosphate_mol, PW_Nitrite_Nitrate_mol, PW_Silicate_mol) %>% 
+  rename("Salinity (PSU)"=Salinity, 
+         "Phosphate (µmol/L)" = PW_Phosphate_mol,
+         "Ammonium (µmol/L)" = PW_Ammonium_mol, 
+         "Silicate (µmol/L)" = PW_Silicate_mol,
+         "Nitrate/Nitrite (µmol/L)" = PW_Nitrite_Nitrate_mol ) %>% 
+  pivot_longer(cols = 4:8, names_to = "Variable", values_to = "Value") %>% 
+  mutate(Variable = factor(Variable, levels= c("Salinity (PSU)", "Nitrate/Nitrite (µmol/L)","Silicate (µmol/L)", "Phosphate (µmol/L)", "Ammonium (µmol/L)")),
+         labelooroo = factor(Variable, labels=c("A", "B", "C", "D", "E")))
+
+porewater_long %>% 
+  ggplot(aes(Transect, Value)) + 
+  geom_boxplot(aes(fill=Transect, color=Transect), alpha=0.4, outlier.shape = NA) +
+  scale_color_manual(values = myCol) +
+  scale_fill_manual(values = myCol) +
+  geom_jitter(aes(pch=Month, fill=Transect), color="grey35", width = 0.05, height=0)+
+  facet_nested(labelooroo + Variable ~., scales = "free_y", switch="y",
+             strip = strip_themed(background_y = list(
+               element_blank(),
+               element_blank()
+             ),
+             text_y = list(
+               element_text(vjust = 1, angle = 0, size = rel(1.3), face = "bold", margin = margin(t = 0, r = 5.5)),
+               element_text(vjust = .5, angle = 90, size = rel(0.9), margin = margin(4.4, 4.4, 4.4, 4.4))
+             ),
+             by_layer_y = TRUE
+             )) +
+    scale_shape_manual(values = c(21,24,22,23,25), labels = c("May", "June", "July", "Aug", "Sept")) +
+  theme_cowplot() +
+  labs(color="Station", fill="Station", x="Station") +
+  theme(strip.placement = "outside", 
+        axis.title = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.border = element_rect(color="black"), 
+        axis.text.x = element_text(size=10,angle = 45, vjust = 1, hjust=1), 
+        panel.grid.major.y = element_line(color="grey85"), 
+        strip.text.y = element_text(size=11),
+        panel.spacing = unit(1.5, "lines")) +
+  guides(color = guide_legend(override.aes = list(shape = c(NA))))
+
+# Checking porewater salinity vs. tidal level
+
+sediment_environmental %>% 
+  ggplot(aes(Transect, Salinity, color=`Rising or falling?`, shape = Month)) +
+  geom_point()
+
+sediment_environmental %>% 
+  ggplot(aes(`Tidal Height (cm)`, Salinity, color=`Rising or falling?`, shape = Month)) +
+  geom_point() +
+  facet_wrap(~Transect, scales = "free")
+
+# Does not seem to be an overall impact of tidal height (probably because targeted similar tidal heights for sampling), seasonality looks much more important for subtidal and intertidal especially
+```
+
+## Indicators of OM Quality and Quantity (S6)
+```{r}
+om_long <- sediment_environmental %>% select(Sample_Code, Transect, Month, `Chla (mg/m3)`, `% Phaeo`, DOM_a254, DOM_E2_E3, DOM_Slope350_400) %>% 
+  mutate(`Chla (mg/m3)` = `Chla (mg/m3)`/1000) %>% 
+  rename("Chl-a (µg/mL)"=`Chla (mg/m3)`, 
+         "Phaeopigments (%)" = `% Phaeo`,
+         "cDOM abs 254nm" = DOM_a254, 
+         "cDOM E2/E3" = DOM_E2_E3,
+         "cDOM Slope 350-400" = DOM_Slope350_400) %>% 
+  pivot_longer(cols = 4:8, names_to = "Variable", values_to = "Value") %>% 
+  mutate(Variable = factor(Variable, levels= c("Chl-a (µg/mL)", "Phaeopigments (%)", "cDOM abs 254nm", "cDOM E2/E3", "cDOM Slope 350-400")),
+         labelooroo = factor(Variable, labels=c("A", "B", "C", "D", "E")))
+
+no_chl <-  om_long %>% filter(Variable != "Chl-a (µg/mL)") %>% 
+  ggplot(aes(Transect, Value)) + 
+  geom_boxplot(aes(fill=Transect, color=Transect), alpha=0.4, outlier.shape = NA) +
+  scale_color_manual(values = myCol) +
+  scale_fill_manual(values = myCol) +
+  geom_jitter(aes(pch=Month, fill=Transect), color="grey35", width = 0.05, height=0)+
+  facet_nested(labelooroo + Variable ~., scales = "free_y", switch="y",
+             strip = strip_themed(background_y = list(
+               element_blank(),
+               element_blank()
+             ),
+             text_y = list(
+               element_text(vjust = 1, angle = 0, size = rel(1.3), face = "bold", margin = margin(t = 0, r = 5.5)),
+               element_text(vjust = .5, angle = 90, size = rel(0.9), margin = margin(4.4, 4.4, 4.4, 4.4))
+             ),
+             by_layer_y = TRUE
+             )) +
+    scale_shape_manual(values = c(21,24,22,23,25), labels = c("May", "June", "July", "Aug", "Sept")) +
+  theme_cowplot() +
+  labs(color="Station", fill="Station", x="Station") +
+  theme(strip.placement = "outside", 
+        axis.title = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.border = element_rect(color="black"), 
+        axis.text.x = element_text(size=10,angle = 45, vjust = 1, hjust=1), 
+        panel.grid.major.y = element_line(color="grey85"), 
+        strip.text.y = element_text(size=11),
+        panel.spacing = unit(1.5, "lines")) +
+  guides(color = guide_legend(override.aes = list(shape = c(NA))))
+
+
+only_chl <-  om_long %>% filter(Variable == "Chl-a (µg/mL)") %>% 
+  ggplot(aes(Transect, Value)) + 
+  geom_boxplot(aes(fill=Transect, color=Transect), alpha=0.4, outlier.shape = NA) +
+  scale_color_manual(values = myCol) +
+  scale_fill_manual(values = myCol) +
+  geom_jitter(aes(pch=Month, fill=Transect), color="grey35", width = 0.05, height=0)+
+  facet_nested(labelooroo + Variable ~., scales = "free_y", switch="y",
+             strip = strip_themed(background_y = list(
+               element_blank(),
+               element_blank()
+             ),
+             text_y = list(
+               element_text(vjust = 1, angle = 0, size = rel(1.3), face = "bold", margin = margin(t = 0, r = 5.5)),
+               element_text(vjust = .5, angle = 90, size = rel(0.9), margin = margin(4.4, 4.4, 4.4, 4.4))
+             ),
+             by_layer_y = TRUE
+             )) +
+    scale_shape_manual(values = c(21,24,22,23,25), labels = c("May", "June", "July", "Aug", "Sept")) +
+  theme_cowplot() +
+  labs(color="Station", fill="Station", x="Station") +
+  theme(strip.placement = "outside",
+        legend.position = "none",
+        axis.title = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.border = element_rect(color="black"), 
+        panel.grid.major.y = element_line(color="grey85"), 
+        strip.text.y = element_text(size=11),
+        panel.spacing = unit(1.5, "lines"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  guides(color = guide_legend(override.aes = list(shape = c(NA)))) +
+  scale_y_log10()
+  
+plot_grid(only_chl, no_chl, nrow=2, align = "v", axis="lr", rel_heights = c(.9,4))
+```
+
+## Biolog EcoPlate Suspension Water (S1)
+```{r}
+suspension_long <- adjacent_water_enviro %>% select(Station, Month, Salinity, Ammonium_mol, Phosphate_mol, Nitrite_Nitrate_mol, Silicate_mol) %>% 
+  mutate(Station = factor(Station, levels=c("SeawaterLab", "River"), labels=c("Marine", "River"))) %>% 
+  rename("Salinity (PSU)"=Salinity, 
+         "Phosphate (µmol/L)" = Phosphate_mol,
+         "Ammonium (µmol/L)" = Ammonium_mol, 
+         "Silicate (µmol/L)" = Silicate_mol,
+         "Nitrate/Nitrite (µmol/L)" = Nitrite_Nitrate_mol ) %>% 
+  pivot_longer(cols = 3:7, names_to = "Variable", values_to = "Value") %>% 
+  mutate(Variable = factor(Variable, levels= c("Salinity (PSU)", "Nitrate/Nitrite (µmol/L)","Silicate (µmol/L)", "Phosphate (µmol/L)", "Ammonium (µmol/L)")),
+         labelooroo = factor(Variable, labels=c("A", "B", "C", "D", "E")))
+
+suspension_long %>% 
+  ggplot(aes(Station, Value)) + 
+  geom_boxplot(aes(fill=Station, color=Station), alpha=0.4, outlier.shape = NA) +
+  scale_color_manual(values = c("darkblue", myCol[4])) +
+  scale_fill_manual(values = c("darkblue", myCol[4])) +
+  geom_jitter(aes(pch=Month, fill=Station), color="grey35", width = 0.05, height=0)+
+  facet_nested(labelooroo + Variable ~., scales = "free_y", switch="y",
+             strip = strip_themed(background_y = list(
+               element_blank(),
+               element_blank()
+             ),
+             text_y = list(
+               element_text(vjust = 1, angle = 0, size = rel(1.3), face = "bold", margin = margin(t = 0, r = 5.5)),
+               element_text(vjust = .5, angle = 90, size = rel(0.9), margin = margin(4.4, 4.4, 4.4, 4.4))
+             ),
+             by_layer_y = TRUE
+             )) +
+    scale_shape_manual(values = c(21,24,22,23,25), labels = c("May", "June", "July", "Aug", "Sept")) +
+  theme_cowplot() +
+  labs(color="Station", fill="Station", x="Station") +
+  theme(strip.placement = "outside", 
+        axis.title = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.border = element_rect(color="black"), 
+        axis.text.x = element_text(size=10,angle = 45, vjust = 1, hjust=1), 
+        panel.grid.major.y = element_line(color="grey85"), 
+        strip.text.y = element_text(size=11),
+        panel.spacing = unit(1.5, "lines")) +
+  guides(color = guide_legend(override.aes = list(shape = c(NA))))
+```
+
+
+# Plotting DNA Data
+
+## Proportional Bar Graph by Class (Fig. 2)
+```{r}
+ps_top_class_wspc <- aggregate_top_taxa(ps_proportions_wspc, level="Class", top=21)
+
+regexp <- "[[:digit:]]+"
+
+top_class <- bind_cols(as.data.frame(otu_table(ps_top_class_wspc)), as.data.frame(tax_table(ps_top_class_wspc))) %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="Sample") %>% 
+  slice(-c(47, 54,55)) %>% 
+  mutate_at(vars(2:23), as.numeric) %>% 
+  rename("KD4-96 (Chloroflexi)" = "KD4-96") %>% 
+  mutate(Month = str_extract(Sample, regexp),
+         station = substr(Sample, 3, 7), 
+         Transect = factor(station, levels = c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River")), 
+         Site = substr(Sample, 9,9), 
+         Month.site = paste(Month, Site, sep="-"), 
+         `Other/Unidentifed` = Other + Unknown) %>% 
+  select(-c(Other, Unknown)) %>% 
+  pivot_longer(cols=c(2:21,27), names_to = "Class", values_to = "Standardized Counts")
+
+
+class_lvls <- top_class %>% group_by(Class) %>% summarise(mean = mean(`Standardized Counts`)) %>% 
+  arrange(desc(mean)) %>% slice(-c(4)) %>% select(Class) %>% 
+  rbind(c("Other/Unidentifed"))
+
+ghibli_top_class <- c('#004749', '#278B9A', '#5E2D30', '#73684C', '#ECD89D',
+                      '#B3DDEB', '#E75B64', '#278B9A', '#40561C', '#5C5992', 
+                      '#DE7862', '#1C77A3', '#030A10', '#5A6F80', '#AE93BE',
+                      '#4D6D93',  '#58A449', '#E48C2A', '#DCCA2C', '#92BBD9',
+                      'grey63')
+
+
+river_bar_class <- top_class %>% filter(Transect == "River") %>% ggplot(aes(Month.site, `Standardized Counts`, fill=factor(Class, levels = class_lvls$Class))) + 
+  geom_col() + 
+  scale_fill_manual(values = ghibli_top_class) + 
+  facet_grid(~Transect, scales = "free_x", space="free") + 
+  labs(x="", fill="Class") + 
+  theme(legend.position="right", 
+        legend.key.size = unit(0.4, "cm"),
+        legend.text = element_text(size=18), 
+        legend.title = element_text(size=20),
+        axis.ticks = element_blank(),
+        strip.background = element_rect(fill=NA, color=myCol[4], size=3), 
+        strip.text = element_text(size = 25, face = "bold"), 
+        panel.spacing = unit(1, "lines"), 
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank(), 
+        panel.border = element_rect(size=1, fill = NA), 
+        axis.title = element_blank(), 
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(face = "bold", size=16)) +
+  guides(fill=guide_legend(ncol=1)) +
+  scale_y_continuous(limits = c(0,1.001), expand = c(0, 0)) +
+  scale_x_discrete(labels=c("", "Jun", "","", "July", "","", "Aug", "","", "Sept", ""))
+
+shelf_bar_class <- top_class %>% filter(Transect == "Intertidal") %>% ggplot(aes(Month.site, `Standardized Counts`, fill=factor(Class, levels = class_lvls$Class))) + 
+  geom_col() + 
+  scale_fill_manual(values = ghibli_top_class) + 
+  facet_grid(~Transect, scales = "free_x", space="free") + 
+  labs(x="", fill="Class") + 
+  theme(legend.position="none", 
+        legend.key.size = unit(0.2, "cm"), 
+        axis.ticks = element_blank(),
+        strip.background = element_rect(fill=NA, color=myCol[3], size=3), 
+        strip.text = element_text(size = 25, face = "bold"), 
+        panel.spacing = unit(1, "lines"), 
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank(), 
+        panel.border = element_rect(size=1, fill = NA), 
+        axis.title = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.text.x = element_text(face = "bold", size=16)) +
+  guides(fill=guide_legend(ncol=1)) +
+  scale_y_continuous(limits = c(0,1.001), expand = c(0, 0)) +
+  scale_x_discrete(labels=c("  May", "", "", "Jun", "","", "July", "","", "Aug", "","", "Sept", ""))
+
+delta_bar_class <- top_class %>% filter(Transect == "Subtidal") %>% ggplot(aes(Month.site, `Standardized Counts`, fill=factor(Class, levels = class_lvls$Class))) + 
+  geom_col() + 
+  scale_fill_manual(values = ghibli_top_class) + 
+  facet_grid(~Transect, scales = "free_x", space="free") + 
+  labs(x="", fill="Class") + 
+  theme(legend.position="none", 
+        legend.key.size = unit(0.2, "cm"), 
+        axis.ticks = element_blank(),
+strip.background = element_rect(fill=NA, color=myCol[2], size=3),
+strip.text = element_text(size = 25, face = "bold"), 
+        panel.spacing = unit(1, "lines"), 
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank(), 
+        panel.border = element_rect(size=1, fill = NA), 
+        axis.title = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.text.x = element_text(face = "bold", size=16)) +
+  guides(fill=guide_legend(ncol=1)) +
+  scale_y_continuous(limits = c(0,1.001), expand = c(0, 0)) +
+  scale_x_discrete(labels=c(" Jun","","", "July", "","", "Aug", "","", "Sept", ""))
+
+
+fjord_bar_class <- top_class %>% filter(Transect == "Fjord") %>% ggplot(aes(Month.site, `Standardized Counts`, fill=factor(Class, levels = class_lvls$Class))) + 
+  geom_col() + 
+  scale_fill_manual(values = ghibli_top_class) + 
+  facet_grid(~Transect, scales = "free_x", space="free") + 
+  labs(y="Proportion of Reads", x="", fill="Class") + 
+  theme(legend.position="none", 
+        legend.key.size = unit(0.2, "cm"), 
+        axis.ticks = element_blank(),
+        strip.background = element_rect(fill=NA, color=myCol[1], size=3), 
+        strip.text = element_text(size = 25, face = "bold"),
+        panel.spacing = unit(1, "lines"), 
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank(), 
+        panel.border = element_rect(size=1, fill = NA), 
+        axis.title.x = element_blank(), 
+        axis.text.x = element_text(face = "bold", size=16), 
+        axis.title.y = element_text(size=18, face= "bold"), 
+        axis.text.y = element_text(size=15)) +
+  guides(fill=guide_legend(ncol=1)) +
+  scale_y_continuous(limits = c(0,1.001), expand = c(0, 0)) +
+  scale_x_discrete(labels=c("", "May", "","", "Jun", "","", "July", "","", "Aug", "","", "Sept", ""))
+
+plot_grid(fjord_bar_class, delta_bar_class, shelf_bar_class, river_bar_class, nrow=1, rel_widths = c(1.5,0.95,1.2,2.3))
+
+# To print plot, run following in console :
+tiff(filename="~/Desktop/Desktop/Norway/Research/Writing/Trying to publish/Figures/Figure_2.tiff", units="mm", width=336, height=165, res=400)
+plot_grid(fjord_bar_class, delta_bar_class, shelf_bar_class, river_bar_class, 
+          nrow=1, rel_widths = c(1.6,0.95,1.15,2.5))
+dev.off()
+```
+
+## Hierarchical Clustering (Fig. 3a)
+```{r}
+chi_comp <- vegdist(otu_prop, method = "chisq")
+
+chi_clust <- hclust(chi_comp, method = "ward.D2", members = NULL)
+
+chi_clust_den <- chi_clust %>% as.dendrogram()
+
+cols_clust <- data.frame(station_color = myCol[c(2,1,4,3)],
+                         Station = levels(factor(samples$Station)))
+
+shape_clust <- data.frame(month_pch = c(21,24,22,23,25),
+                          month_ed = c(16,17,15,18,25),
+                         Month = levels(factor(samples$Month)))
+
+clust_meta <- data.frame(Sample = chi_clust$labels[order.dendrogram(chi_clust_den)]) %>%
+  mutate(Month = str_sub(Sample,1,1),
+         Station = str_sub(Sample, 3,7)) %>%
+  full_join(cols_clust) %>%
+  full_join(shape_clust)
+
+
+chi_clust_ed <- chi_clust_den %>% 
+  dendextend::set("leaves_pch", clust_meta$month_ed) %>%
+  dendextend::set("leaves_col", clust_meta$station_color) %>%
+  dendextend::set("leaves_cex", c(2)) %>%
+  dendextend::set("labels","") %>%
+  dendextend::rotate(c(27:32,
+                       39:44, 33:38,
+                       48:52,45:47,
+                       13:15, 21:26, 16:20,
+                       1:12))
+
+
+# Save the whole plot 
+
+cluster_plot %<a-% { plot(chi_clust_ed, ylim = c(0,8)) 
+
+chi_clust_ed %>% rect.dendrogram(k=5, border = 8, lty = 5, lwd = 1)
+
+legend(45,8,
+     legend = c("Fjord", "Subtidal", "Intertidal", "River","", "May", "June", "July", "Aug", "Sept"),
+     col = c(cols_clust$station_color[c(2,1,4,3)],"white", rep("black",5)),
+     pch = c(rep(16, 5),16,17,15,18,25), bty = "o",  pt.cex = 1.5, cex = 0.8 ,
+     text.col = "black", horiz = FALSE, inset = c(0, 0.1))
+
+text(x = c(3.5,12.5,22,33,46), y=-.8, labels = c("Post-Bloom", "Late Marine", "Pre-Melt", "Melt Influenced","Riverine"), srt = 0,  xpd = T)
+
+text(x = c(12.75,39.5), y=-1.4, labels = c(expression(italic(Marine)), expression(italic(Freshwater))), srt = 0,  xpd = T, cex=1.4) 
+}
+
+cluster_plot %<a-% { plot(chi_clust_ed, ylim = c(0,8), xlim=c(0,58)) 
+
+chi_clust_ed %>% rect.dendrogram(k=5, border = 8, lty = 5, lwd = 1)
+
+legend(53,6,
+     legend = c("Fjord", "Subtidal", "Intertidal", "River","", "May", "June", "July", "Aug", "Sept"),
+     col = c(cols_clust$station_color[c(2,1,4,3)],"white", rep("black",5)),
+     pch = c(rep(16, 5),16,17,15,18,25), bty = "n",  pt.cex = 1.5, cex = 0.8 ,
+     text.col = "black", horiz = FALSE, inset = c(0, 0.1))
+
+text(x = c(3.5,12.5,22,33,46), y=-.8, labels = c("Post-Bloom", "Late Marine", "Pre-Melt", "Melt Influenced","Riverine"), srt = 0,  xpd = T)
+
+text(x = c(12.75,39.5), y=-1.4, labels = c(expression(italic(Marine)), expression(italic(Freshwater))), srt = 0,  xpd = T, cex=1.4) 
+}
+
+# Plot the dendrogram 
+cluster_plot
+
+cluster_plot_fin <- recordPlot()
+invisible(dev.off())
+```
+
+### Anosim and post-hoc for significance of clusters
+### Anosim
+```{r}
+anosim(otu_prop, samples$Cluster, distance = "chisq")
+```
+
+
+
+### Anosim post-hoc
+Source: https://github.com/chassenr/ARISA/blob/master/anosimPosthoc.R 
+
+```{r}
+ANOSIMposthoc <- function(
+  M,
+  E,
+  distance = "bray", 
+  padj = "fdr",
+  strata = NULL,
+  type.within = NULL, 
+  type.plots = NULL
+) {
+  E = droplevels(E)
+  Mlist = list()
+  for(i in 1:length(levels(E))){
+    Mlist[[i]] = M[E == levels(E)[i], ]
+  }
+  
+  Elist = list()
+  for(i in 1:length(levels(E))){
+    Elist[[i]] = as.numeric(E[E == levels(E)[i]])
+  }
+  
+  if(!is.null(strata)) {
+    Slist = list()
+    for(i in 1:length(levels(E))){
+      Slist[[i]] = as.numeric(strata[E == levels(E)[i]])
+    }
+  }
+  
+  result = list(
+    anosimR = matrix(NA, length(levels(E)), length(levels(E))),
+    anosimP = matrix(NA, length(levels(E)), length(levels(E))),
+    anosimPadj = matrix(NA, length(levels(E)), length(levels(E))))
+  colnames(result$anosimR) = colnames(result$anosimP) = levels(E)
+  rownames(result$anosimR) = rownames(result$anosimP) = levels(E)
+  for(i in 1:(length(levels(E)) - 1)){
+    for(j in (i + 1):length(levels(E))){
+      if(is.null(strata)) {
+        temp = anosim(
+          rbind(Mlist[[i]], Mlist[[j]]),
+          c(Elist[[i]], Elist[[j]]),
+          distance = distance
+        )
+      } else {
+        temp = anosim(
+          rbind(Mlist[[i]], Mlist[[j]]),
+          c(Elist[[i]], Elist[[j]]),
+          distance = distance,
+          permutations = how(
+            within = Within(type = type.within),
+            plots = Plots(strata = c(Slist[[i]], Slist[[j]]), type = type.plots),
+            nperm = 999
+          )
+        )
+      }
+      result$anosimR[j,i] = temp$statistic
+      result$anosimP[j,i] = temp$signif
+    }
+  }
+  result$anosimPadj = matrix(
+    p.adjust(
+      as.vector(result$anosimP), 
+      method = padj, 
+      n = length(which(!is.na(as.vector(result$anosimP))))
+    ),
+    length(levels(E)),
+    length(levels(E))
+  )
+  colnames(result$anosimPadj) = levels(E)
+  rownames(result$anosimPadj) = levels(E)
+  return(result)
+}
+```
+
+
+```{r}
+ANOSIMposthoc(otu_prop, samples$Cluster, distance="chisq", padj="BH") # chi-sq distances with Benjamini & Hochberg p-value correction
+
+ANOSIMposthoc(otu_prop, samples$Cluster, distance="bray", padj="BH") # bray distances with Benjamini & Hochberg p-value correction
+ANOSIMposthoc(otu_prop, samples$Cluster, distance="jaccard", padj="BH") # jaccard distances with Benjamini & Hochberg p-value correction
+```
+
+
+
+## Heatmap of environmental data by cluster (Fig. 3b)
+```{r}
+enviro_heat <- sediment_environmental %>% 
+  filter(Sample_Code != "7.D.z",Sample_Code != "5.S.x") %>% 
+  mutate(Sample = paste(str_sub(Sample_Code, 1,1), Station, Site, sep = "-")) %>% 
+  column_to_rownames(var="Sample") %>% drop_na(`>2mm`) %>% 
+  select(where(is.numeric)) %>% 
+  select(-c(Sediment_temp, Station_Depth, DOM_a250, DOM_a365, DOM_a375, 
+            PW_Ammonium, PW_Nitrite_Nitrate, 
+            PW_Phosphate, PW_Silicate,
+            `250-500µm`, `500µm-1mm`, `1-2mm`, `>2mm`,
+            `63-250µm`, Bulk_density, 
+            Phaeo, DOM_Slope275_295, 
+            DOM_SR)) %>% 
+  rownames_to_column(var="Sample") %>% 
+  mutate(`Chla (mg/m3)` = `Chla (mg/m3)`/1000) %>% 
+  left_join(samples) %>% 
+  group_by(Clade) %>% 
+  summarise(across(where(is.numeric), mean, na.rm=T)) %>% 
+  mutate(across(where(is.numeric), scale)) %>% 
+  select(-c(Month)) %>% 
+  pivot_longer(cols = 2:17, names_to = "Variable", values_to = "Value") %>% 
+  mutate(Cluster = factor(Clade, levels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "Intertidal", "River"),  labels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "Melt-Influenced", "Riverine")), 
+         Type = ifelse(Variable %in% c(">250µm","125-250µm","63-125µm", 
+                                       "<63µm", "Porosity", "LOI_percent"), "Sediment Characteristics", "Porewater Chemistry"),
+         Type = ifelse(Variable %in% c("Chla (mg/m3)", "% Phaeo",
+                                       "DOM_a254", "DOM_E2_E3",
+                                       "DOM_Slope350_400"), 
+                       "Indicators of OM Quality", Type), 
+         Variable = factor(Variable, levels = c(">250µm","125-250µm","63-125µm", 
+                                                "<63µm", "Porosity", "LOI_percent",
+                                                "Salinity", "PW_Phosphate_mol",
+                                                "PW_Ammonium_mol", "PW_Silicate_mol", 
+                                                "PW_Nitrite_Nitrate_mol", 
+                                                "Chla (mg/m3)", "% Phaeo", 
+                                                "DOM_a254", "DOM_E2_E3", 
+                                                "DOM_Slope350_400"), 
+                           labels = c(">250µm (%)","125-250µm (%)","63-125µm (%)",
+                                      "<63µm (%)", "Porosity", "LOI (%)",
+                                      "Salinity (PSU)", "PO4 (µmol/L)",
+                                      "NH4 (µmol/L)", "SO2 (µmol/L)",
+                                      "NO3+NO2 (µmol/L)", 
+                                      "Chl-a (µg/mL)", "Phaeopigments (%)",
+                                      "DOM abs 254nm", "DOM E2/E3", 
+                                      "DOM Slope 350-400")))
+
+
+enviro_means <- sediment_environmental %>% 
+  filter(Sample_Code != "7.D.z",Sample_Code != "5.S.x") %>% 
+  mutate(Sample = paste(str_sub(Sample_Code, 1,1), Station, Site, sep = "-")) %>% 
+  column_to_rownames(var="Sample") %>% drop_na(`>2mm`) %>% 
+  select(where(is.numeric)) %>% 
+  select(-c(Sediment_temp, Station_Depth, DOM_a250, DOM_a365, DOM_a375, 
+            PW_Ammonium, PW_Nitrite_Nitrate, 
+            PW_Phosphate, PW_Silicate,
+            `250-500µm`, `500µm-1mm`, `1-2mm`, `>2mm`,
+            `63-250µm`, Bulk_density, 
+            Phaeo, DOM_Slope275_295, 
+            DOM_SR)) %>% 
+  rownames_to_column(var="Sample") %>% 
+  left_join(samples) %>% 
+  mutate(`Chla (mg/m3)` = `Chla (mg/m3)`/1000) %>% 
+  group_by(Clade) %>% 
+  summarise(across(where(is.numeric), mean, na.rm=T)) %>% 
+  select(-c(Month)) %>% 
+  pivot_longer(cols = 2:17, names_to = "Variable", values_to = "Value") %>% 
+  mutate(Cluster = factor(Clade, levels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "Intertidal", "River")), 
+         Variable = factor(Variable, levels = c( ">250µm","125-250µm","63-125µm", 
+                                                "<63µm", "Porosity", "LOI_percent",
+                                                "Salinity", "PW_Phosphate_mol",
+                                                "PW_Ammonium_mol", "PW_Silicate_mol", 
+                                                "PW_Nitrite_Nitrate_mol", 
+                                                "Chla (mg/m3)", "% Phaeo", 
+                                                "DOM_a254", "DOM_E2_E3", 
+                                                "DOM_Slope350_400"), 
+                           labels = c(">250µm (%)","125-250µm (%)","63-125µm (%)",
+                                      "<63µm (%)", "Porosity", "LOI (%)",
+                                      "Salinity (PSU)", "PO4 (µmol/L)",
+                                      "NH4 (µmol/L)", "SO2 (µmol/L)",
+                                      "NO3+NO2 (µmol/L)", 
+                                      "Chl-a (µg/mL)", "Phaeopigments (%)",
+                                      "DOM abs 254nm", "DOM E2/E3", 
+                                      "DOM Slope 350-400")))
+
+
+enviro_sd <- sediment_environmental %>% 
+  filter(Sample_Code != "7.D.z",Sample_Code != "5.S.x") %>% 
+  mutate(Sample = paste(str_sub(Sample_Code, 1,1), Station, Site, sep = "-")) %>% 
+  column_to_rownames(var="Sample") %>% drop_na(`>2mm`) %>% 
+  select(where(is.numeric)) %>% 
+  select(-c(Sediment_temp, Station_Depth, DOM_a250, DOM_a365, DOM_a375, 
+            PW_Ammonium, PW_Nitrite_Nitrate, 
+            PW_Phosphate, PW_Silicate,
+            `250-500µm`, `500µm-1mm`, `1-2mm`, `>2mm`,
+            `63-250µm`, Bulk_density, 
+            Phaeo, DOM_Slope275_295, 
+            DOM_SR)) %>% 
+  rownames_to_column(var="Sample") %>% 
+  left_join(samples) %>% 
+  mutate(`Chla (mg/m3)` = `Chla (mg/m3)`/1000) %>% 
+  group_by(Clade) %>% 
+  summarise(across(where(is.numeric), sd, na.rm=T)) %>% 
+  select(-c(Month)) %>% 
+  pivot_longer(cols = 2:17, names_to = "Variable", values_to = "SD_Value") %>% 
+  mutate(Cluster = factor(Clade, levels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "Intertidal", "River")), 
+         Variable = factor(Variable, levels = c( ">250µm","125-250µm","63-125µm", 
+                                                "<63µm", "Porosity", "LOI_percent",
+                                                "Salinity", "PW_Phosphate_mol",
+                                                "PW_Ammonium_mol", "PW_Silicate_mol", 
+                                                "PW_Nitrite_Nitrate_mol", 
+                                                "Chla (mg/m3)", "% Phaeo", 
+                                                "DOM_a254", "DOM_E2_E3", 
+                                                "DOM_Slope350_400"), 
+                           labels = c(">250µm (%)","125-250µm (%)","63-125µm (%)",
+                                      "<63µm (%)", "Porosity", "LOI (%)",
+                                      "Salinity (PSU)", "PO4 (µmol/L)",
+                                      "NH4 (µmol/L)", "SO2 (µmol/L)",
+                                      "NO3+NO2 (µmol/L)", 
+                                      "Chl-a (µg/mL)", "Phaeopigments (%)",
+                                      "DOM abs 254nm", "DOM E2/E3", 
+                                      "DOM Slope 350-400")))
+
+library(ggfittext)
+
+enviro_heat %>% ggplot(aes(Variable, Cluster, fill=Value)) +
+  geom_tile() +
+  scale_fill_gradient2(high = "#6C0000", mid = "#FFFFFF", low = "#00586C", midpoint = 0) +
+  geom_text(aes(label=paste(signif(enviro_means$Value,2), signif(enviro_sd$SD_Value,1), sep="±")), alpha=0.6) + 
+  geom_text(data = enviro_heat[enviro_heat$Value>1.25 | enviro_heat$Value < -1.2,],  aes(label=paste(signif(enviro_means$Value[enviro_heat$Value>1.25 | enviro_heat$Value < -1.2],2), signif(enviro_sd$SD_Value[enviro_heat$Value>1.25 | enviro_heat$Value < -1.2],1), sep = "±")), alpha=0.7, color="white") +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size=15), 
+        axis.text.y = element_text(size=18),
+        text = element_text(size=20), 
+        axis.title = element_blank(),
+        legend.title = element_blank(), 
+        panel.spacing = unit(0.05,"cm")) +
+  facet_grid(~factor(Type, unique(Type)[c(1,3,2)]), scales = "free_x", space = "free")
+
+enviro_heat$labeloo <- str_wrap(paste(formatC(signif(enviro_means$Value,2), digits=2,format="fg", flag="#"), formatC(signif(enviro_sd$SD_Value,2), digits=2,format="fg", flag="#"), sep=" ±"),1)
+
+#Displays means and standard deviations 
+enviro_by_cluster <- enviro_heat %>% ggplot(aes(Variable, Cluster, fill=Value)) +
+  geom_tile() +
+  scale_fill_gradient2(high = "#6C0000", mid = "#FFFFFF", low = "#00586C", midpoint = 0) +
+  geom_fit_text(aes(label=labeloo), alpha=0.65, 
+                contrast = T, grow = F, padding.y = grid::unit(2, "mm")) +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size=12), 
+        axis.text.y = element_text(size=12),
+        text = element_text(size=15), 
+        axis.title = element_blank(),
+        legend.title = element_blank(), 
+        panel.spacing = unit(0.05,"cm")) +
+  facet_grid(~factor(Type, unique(Type)[c(1,3,2)]), scales = "free_x", space = "free")
+```
+
+### Are the differences between the clusters significant?
+```{r}
+clust_enviro <- sediment_environmental %>% 
+  filter(Sample_Code != "7.D.z",Sample_Code != "5.S.x") %>% 
+  mutate(Sample = paste(str_sub(Sample_Code, 1,1), Station, Site, sep = "-")) %>% 
+  column_to_rownames(var="Sample") %>% drop_na(`>2mm`) %>% 
+  select(where(is.numeric)) %>% 
+  select(-c(Sediment_temp, Station_Depth, DOM_a250, DOM_a365, DOM_a375, 
+            PW_Ammonium, PW_Nitrite_Nitrate, 
+            PW_Phosphate, PW_Silicate,
+            `250-500µm`, `500µm-1mm`, `1-2mm`, `>2mm`,
+            `63-250µm`, Bulk_density, 
+            Phaeo, DOM_Slope275_295, 
+            DOM_SR)) %>% 
+  rownames_to_column(var="Sample") %>% 
+  left_join(samples)
+
+# Test for significant differences
+df2 <- clust_enviro %>% select(c(2:17, 25)) %>% gather(key, value, -Cluster) %>% 
+       group_by(key) %>% 
+       do(tidy(kruskal.test(x= .$value, g = .$Cluster))) %>% 
+  mutate(signif_01 = ifelse(p.value<0.05, T, F))
+df2
+
+# Pairwise Dunn Test
+table3 <- data.frame(Groups = rep(NA,160), Z = rep(NA,160), P.adjusted = rep(NA,160), Variable = colnames(clust_enviro)[i])
+
+for (i in 2:17) {
+  table = dunn.test(clust_enviro[,i], clust_enviro$Cluster, list=TRUE)
+  table2 = data.frame(Groups = table$comparisons, Z = table$Z, P.adjusted = table$P.adjusted, Variable = colnames(clust_enviro)[i])
+  table3[c((i-2)*10+1:10),] <- table2[1:10,]
+}
+
+enviro_dunn_results <- table3 %>% separate(Groups, sep = " - ", into = c("Group1", "Group2")) %>% filter(Variable != "PW_Nitrite_Nitrate_mol") %>% 
+  mutate(Z = round(Z, 2), 
+         P.adjusted = round(P.adjusted, 2),
+         Type = ifelse(Variable %in% c(">250µm","125-250µm","63-125µm", 
+                                       "<63µm", "Porosity", "LOI_percent"), "Sediment Characteristics", "Porewater Chemistry"),
+         Type = ifelse(Variable %in% c("Chla (mg/m3)", "% Phaeo",
+                                       "DOM_a254", "DOM_E2_E3",
+                                       "DOM_Slope350_400"), 
+                       "Indicators of OM Quality", Type)) 
+
+library(gt)
+
+sed_char_dunn <-  enviro_dunn_results %>% filter(Type == "Sediment Characteristics") %>% select(-Type) %>% 
+  pivot_wider(names_from = Variable, values_from = c(Z, P.adjusted), 
+              names_glue = "{Variable}_{.value}") %>%
+  select(1,2,3,9,4,10,8,14,5,11,6,12,7,13)
+ 
+pore_dunn <-  enviro_dunn_results %>% filter(Type == "Porewater Chemistry") %>% select(-Type) %>% 
+  pivot_wider(names_from = Variable, values_from = c(Z, P.adjusted), 
+              names_glue = "{Variable}_{.value}") %>%
+  select(1,2,3,7,4,8,5,9,6,10) 
+
+organic_dunn <-  enviro_dunn_results %>% filter(Type == "Indicators of OM Quality") %>% select(-Type) %>% 
+  pivot_wider(names_from = Variable, values_from = c(Z, P.adjusted), 
+              names_glue = "{Variable}_{.value}") %>%
+  select(1,2,3,8,4,9,5,10,6,11,7,12) 
+
+
+builder <- function(x, Limit){cells_body(columns = !!sym(x), rows = !!sym(x) < Limit)}
+
+names <- colnames(sed_char_dunn)[c(4,6,8,10,12,14)] 
+
+sed_char_dunn %>% gt(rowname_col = "Group2", groupname_col = "Group1") %>% 
+  tab_spanner(
+    label = "Porosity",
+    columns = c(Porosity_Z, Porosity_P.adjusted)) %>% 
+  tab_spanner(
+    label = "Organic (%)",
+    columns = c(LOI_percent_Z, LOI_percent_P.adjusted)) %>% 
+  tab_spanner(
+    label = ">250µm (%)",
+    columns = c(`>250µm_Z`, `>250µm_P.adjusted`)) %>% 
+  tab_spanner(
+    label = "125-250µm (%)",
+    columns = c(`125-250µm_Z`, `125-250µm_P.adjusted`)) %>% 
+  tab_spanner(
+    label = "63-125µm (%)",
+    columns = c(`63-125µm_Z`, `63-125µm_P.adjusted`)) %>% 
+  tab_spanner(
+    label = "<63µm (%)",
+    columns = c(`<63µm_Z`, `<63µm_P.adjusted`)) %>% 
+  cols_label(
+    Porosity_Z = "Z",
+    Porosity_P.adjusted = "p",
+    LOI_percent_Z = "Z",
+    LOI_percent_P.adjusted = "p", 
+    `>250µm_Z` = "Z", 
+    `>250µm_P.adjusted`="p",
+    `125-250µm_Z` = "Z",
+    `125-250µm_P.adjusted` = "p", 
+    `63-125µm_Z` = "Z",
+    `63-125µm_P.adjusted` = "p",
+    `<63µm_Z` = "Z",
+    `<63µm_P.adjusted` = "p") %>% 
+  tab_style(style = list(cell_text(weight = "bold")),
+            locations = lapply(names, builder, Limit = 0.05)) %>% 
+    tab_options(row_group.as_column = TRUE) %>% 
+  tab_stubhead(label = "Clusters") %>% 
+  tab_style(style=cell_fill(color="grey90"),
+            locations = cells_body(columns = c(LOI_percent_Z, LOI_percent_P.adjusted, `125-250µm_Z`, `125-250µm_P.adjusted`, `<63µm_Z`, `<63µm_P.adjusted`)))
+
+
+
+names <- colnames(pore_dunn)[c(4,6,8,10)] 
+
+pore_dunn %>% gt(rowname_col = "Group2", groupname_col = "Group1") %>% 
+  tab_spanner(
+    label = "Salinity (PSU)",
+    columns = c(Salinity_Z, Salinity_P.adjusted)) %>% 
+  tab_spanner(
+    label = "PO4 (μmol/L)",
+    columns = c(PW_Phosphate_mol_Z, PW_Phosphate_mol_P.adjusted)) %>% 
+  tab_spanner(
+    label = "NH4 (μmol/L)",
+    columns = c(PW_Ammonium_mol_Z, PW_Ammonium_mol_P.adjusted)) %>% 
+  tab_spanner(
+    label = "SiO2 (μmol/L)",
+    columns = c(PW_Silicate_mol_Z, PW_Silicate_mol_P.adjusted)) %>% 
+  cols_label(
+    Salinity_Z = "Z",
+    Salinity_P.adjusted = "p",
+    PW_Phosphate_mol_Z = "Z",
+    PW_Phosphate_mol_P.adjusted = "p", 
+    PW_Ammonium_mol_Z = "Z", 
+    PW_Ammonium_mol_P.adjusted="p",
+    PW_Silicate_mol_Z = "Z",
+    PW_Silicate_mol_P.adjusted = "p") %>% 
+  tab_style(style = list(cell_text(weight = "bold")),
+            locations = lapply(names, builder, Limit = 0.05)) %>% 
+    tab_options(row_group.as_column = TRUE) %>% 
+  tab_stubhead(label = "Clusters") %>% 
+  tab_style(style=cell_fill(color="grey90"),
+            locations = cells_body(columns = c(PW_Ammonium_mol_Z, PW_Ammonium_mol_P.adjusted, PW_Silicate_mol_Z, PW_Silicate_mol_P.adjusted)))
+
+
+
+
+names <- colnames(organic_dunn)[c(4,6,8,10,12)] 
+
+organic_dunn %>% gt(rowname_col = "Group2", groupname_col = "Group1") %>% 
+  tab_spanner(
+    label = "Chl-a (µg/mL)",
+    columns = c(`Chla (mg/m3)_Z`, `Chla (mg/m3)_P.adjusted`)) %>% 
+  tab_spanner(
+    label = "Phaeo (%)",
+    columns = c(`% Phaeo_Z`, `% Phaeo_P.adjusted`)) %>% 
+  tab_spanner(
+    label = "a254 nm",
+    columns = c(DOM_a254_Z, DOM_a254_P.adjusted)) %>% 
+  tab_spanner(
+    label = "E2/E3",
+    columns = c(DOM_E2_E3_Z, DOM_E2_E3_P.adjusted)) %>% 
+  tab_spanner(
+    label = "Slope 350-400",
+    columns = c(DOM_Slope350_400_Z, DOM_Slope350_400_P.adjusted)) %>% 
+  cols_label(
+    `Chla (mg/m3)_Z` = "Z",
+    `Chla (mg/m3)_P.adjusted` = "p",
+    `% Phaeo_Z` = "Z",
+    `% Phaeo_P.adjusted` = "p", 
+    DOM_a254_Z = "Z", 
+    DOM_a254_P.adjusted="p",
+    DOM_E2_E3_Z = "Z",
+    DOM_E2_E3_P.adjusted = "p",
+    DOM_Slope350_400_Z = "Z",
+    DOM_Slope350_400_P.adjusted = "p") %>% 
+  tab_style(style = list(cell_text(weight = "bold")),
+            locations = lapply(names, builder, Limit = 0.05)) %>% 
+    tab_options(row_group.as_column = TRUE) %>% 
+  tab_stubhead(label = "Clusters") %>% 
+  tab_style(style=cell_fill(color="grey90"),
+            locations = cells_body(columns = c(`% Phaeo_Z`, `% Phaeo_P.adjusted`, DOM_E2_E3_Z, DOM_E2_E3_P.adjusted)))
+```
+
+
+
+## Abundant Genera by cluster (Fig. 3c)
+```{r}
+all_taxa <- tax_table(ps_proportions_wspc) %>% as.data.frame %>% 
+  replace_na(list(Phylum="Unknown Phylum",Class="Unknown Class", Order="Unknown Order",Family="Unknown Family", Genus="Unknown Genus")) %>% 
+  mutate(Species = ifelse(is.na(Species), Species, paste(Genus, Species, sep = " ")), 
+         all = paste(Kingdom, Phylum, Class, Order, Family, Genus, Species, sep = ";"), 
+         all = paste(all, ";", sep=""), 
+         all = str_replace(all, ";NA;", ";")) %>% 
+  rownames_to_column(var = "OTU_number")
+
+
+clade_genus <- otu_table(ps_proportions_wspc) %>% 
+  as.data.frame() %>% 
+  select(-c(`9-River-extra`)) %>% 
+  rownames_to_column(var = "OTU_number") %>%
+  left_join(all_taxa) %>% ungroup() %>% 
+  group_by(Kingdom, Phylum, Class, Order, Family, Genus) %>% 
+  summarise(across(where(is.numeric), sum)) %>% 
+  ungroup() %>% 
+  mutate(all = paste(paste(Kingdom, Phylum, Class, Order, Family, Genus, sep = ";"),";", sep = "")) %>% 
+  select(-c(1:6)) %>% 
+  column_to_rownames(var="all") %>% 
+  t() %>% as.data.frame() %>% 
+  rownames_to_column(var="Sample") %>% 
+  left_join(samples) %>% 
+  group_by(Clade) %>%
+  select(-c(Month)) %>% 
+  summarise(across(where(is.numeric), mean)) %>%
+  column_to_rownames(var="Clade") %>% 
+  t() %>% as.data.frame() %>% 
+  rownames_to_column(var = "all")
+  
+ 
+
+genus_heat_2 <- clade_genus %>% filter(if_any(where(is.numeric), ~ . >0.02)) %>% 
+  left_join(unique(all_taxa[,c(2:7,9)])) %>% 
+  mutate(Genus_heaty = ifelse(Genus == "Unknown Genus", Family, Genus)) %>% 
+  filter(Genus_heaty != "Unknown Family") %>% 
+  pivot_longer(cols = 2:6, names_to = "Cluster", values_to = "Proportion") %>% 
+  mutate(heaty = log10(Proportion*100)) %>% 
+  mutate(Genus_heaty = factor(Genus_heaty, levels = c("Rhodoferax", "Thiobacillus",
+                                                      "Oryzihumus","Gemmatimonadaceae", "Gallionellaceae",
+                                                      "Comamonadaceae", "Flavobacterium",  
+                                                      "Lutibacter", "Sva1033", "Luteolibacter", 
+                                                      "Fluviicola" , "Flavobacteriaceae", "Colwellia", 
+                                                      
+                                                      
+                                                      "Woeseia",  "Yoonia-Loktanella",  "Rhodobacteraceae",  "Psychromonas", "Marinifilum", "Arcobacteraceae", "Desulfuromusa", "Kangiellaceae", "Polaribacter", "Psychrilyobacter", "Leeia"))) %>% 
+  mutate(Geny_heaty = factor(Genus_heaty, levels = c("Leeia", "Gallionellaceae", "Gemmatimonadaceae",
+                                                     "Comamonadaceae","Oryzihumus", "Rhodoferax", "Thiobacillus",
+                                                       
+                                                       "Flavobacterium",  
+                                                      "Lutibacter", "Sva1033", "Luteolibacter", 
+                                                      "Flavobacteriaceae","Yoonia-Loktanella", "Woeseia", "Kangiellaceae","Fluviicola" ,  "Colwellia", 
+                                                         "Rhodobacteraceae", "Polaribacter", "Desulfuromusa",
+                                                     "Psychromonas", "Marinifilum", "Arcobacteraceae",
+                                                      
+                                                     "Psychrilyobacter"))) %>% 
+  mutate(Cluster = factor(Cluster, levels= rev(c("River", "Intertidal",  "Pre-Melt","Late-Marine", "Post-Bloom")), labels = rev(c("Riverine", "Melt-Influenced",  "Pre-Melt", "Late-Marine", "Post-Bloom")))) %>% 
+  mutate(genster = ifelse(grepl("aceae", Geny_heaty), as.character(Geny_heaty), paste("*", Geny_heaty, "*", sep = "")), 
+         genster = ifelse(grepl("Sva", genster), as.character(Geny_heaty), genster)) %>% 
+  arrange(Geny_heaty) %>% 
+  mutate(genster = factor(genster, unique(genster)))
+
+# Showing all genera with >2% in any cluster
+abundant_genera <- genus_heat_2 %>% ggplot(aes(genster, Cluster, fill=heaty)) + 
+  geom_tile() +
+  scale_fill_gradientn(colors = c("#effaf9","#EBF9F7", "#E7F8F5", "#E3F7F3", "#DEF5F1", "#D5F2ED","#ccefe9","#C6EDE8","#b1e6e2","#96dddb","#71aebd","#4b7e9f","#3e356b","#0b0405"),
+                       labels=c("0.0001%", "0.001%", "0.01%", "0.1%", "1%", "10%"), na.value = "grey90")+
+  theme_cowplot() +
+  theme(axis.text.x = element_markdown(angle = 45, vjust = 1, hjust=1), 
+        panel.border = element_rect(color="black", size = 2)) +
+  labs(x="", fill = "Relative \nAbundance", y="") 
+```
+
+## Plot Clustering, Enviro, and Abundant genera together
+```{r}
+# To print plot, run following in console :
+tiff(filename="~/Desktop/Desktop/Norway/Research/Writing/Trying to publish/Figures/Figure_3.tiff", units="mm", width=336, height=400, res=400)
+plot_grid(cluster_plot_fin, enviro_by_cluster, abundant_genera, 
+          nrow = 3, labels = "AUTO", rel_heights = c(1.5,1,0.9), label_size = 20)
+dev.off()
+```
+
+## Riverine taxa porportional abundance in other clusters (Fig. 4)
+```{r}
+river_asvs_id <- otu_table(ps_proportions_wspc) %>% as.matrix() %>% 
+  as.data.frame() %>% 
+  select(-c(`9-River-extra`)) %>% 
+  rownames_to_column(var="OTU_number") %>% 
+  filter(if_any(contains("River"), ~ .>0.0005))
+
+river_asvs_new <- otu_table(ps_proportions_wspc) %>% as.matrix() %>% 
+  as.data.frame() %>% 
+  select(-c(`9-River-extra`)) %>% 
+  rownames_to_column(var="OTU_number") %>% 
+  mutate(river = ifelse(OTU_number %in% river_asvs_id$OTU_number, "yes", "no")) %>% 
+  pivot_longer(cols = -c(1,54), names_to = "Sample", values_to = "Proportion") %>% 
+  full_join(samples)
+
+river_asvs_proportions <- river_asvs_new %>% 
+  group_by(Sample, Transect, Month_n, Clade, river) %>% 
+  summarise(Proportion = sum(Proportion)) %>% 
+  mutate(Cluster = factor(Clade, levels = c("Post-Bloom",  "Late-Marine","Pre-Melt", "Intertidal", "River"), 
+                          labels = c("Post-Bloom",  "Late-Marine", "Pre-Melt", "Melt-Influenced", "River"))) %>% 
+  arrange(Proportion)
+
+
+river_yes_asvs_proportions <- river_asvs_proportions %>% filter(river == "yes", Transect != "River")
+
+# test for difference between clusters 
+kruskal.test(river_yes_asvs_proportions$Proportion, river_yes_asvs_proportions$Cluster)
+# yes significant!
+
+# post-hoc Dunn test for evaluating which are different @ 0.05
+dunn.test(river_yes_asvs_proportions$Proportion, river_yes_asvs_proportions$Cluster, "bh")
+# MI diff from everything else
+# PB diff from LM also
+
+
+# Set up dataframe for plotting significant differences
+letters_river <- river_asvs_proportions %>% filter(river == "yes", Transect != "River") %>% group_by(Cluster) %>% summarise(posssy = max(Proportion*100)+6) %>% mutate(texty = c("a", "b", "a,b", "c"))
+
+
+river_asvs_plot <- river_asvs_proportions %>% filter(river == "yes", Transect != "River") %>% 
+  ggplot(aes(Cluster, Proportion*100))+
+  geom_boxplot(fill = "grey55", outlier.shape = NA) + 
+  geom_jitter(width = 0.05, height=0, size=4, aes(col= Transect)) +
+  geom_text(data=letters_river, aes(Cluster, posssy, label=texty), size=6)+
+  labs(y="Relative Abundance Riverine Taxa (%)", color="Station") +
+  theme_cowplot()+
+  scale_colour_manual(values = myCol) +
+  scale_fill_manual(values = myCol) +
+  scale_shape_manual(values = c(21,24,22,23,25)) +
+  facet_grid(~Cluster, scales="free_x") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = c(.02,.82), 
+        legend.margin=margin(c(5,5,5,5)),
+        legend.box.background = element_rect(colour = "black", size = 0.4),
+        panel.grid.major.y = element_line(color="grey45", size=0.2), 
+        axis.ticks.x = element_blank(),
+        panel.spacing.x = unit(0,"line"),
+        strip.text = element_text(size=14),
+        strip.background = element_rect(fill="white", colour = "black", linewidth = 1)) 
+
+
+river_asvs_plot <- river_asvs_proportions %>% filter(river == "yes", Transect != "River") %>% 
+  ggplot(aes(Cluster, Proportion*100))+
+  geom_boxplot(fill = "grey55", outlier.shape = NA) + 
+  geom_jitter(width = 0.05, height=0, size=4, aes(fill= Transect),pch=21, col="grey35") +
+  geom_text(data=letters_river, aes(Cluster, posssy, label=texty), size=6) +
+  labs(y="Relative Abundance Riverine Taxa (%)", color="Station") +
+  # theme_cowplot()+
+  scale_fill_manual(values = myCol) +
+  theme(legend.position = c(.15,.82), 
+        legend.margin=margin(c(10,10,5,5)),
+        legend.box.background = element_rect(colour = "black", size = 0.4),
+        panel.grid.major.y = element_line(color="grey45", size=0.2), 
+        panel.grid.major.x = element_blank(),
+        axis.ticks.x = element_blank(), 
+        panel.background = element_rect(fill=NA),
+        panel.border = element_rect(fill=NA,colour = "black", linewidth = 1),
+        axis.text = element_text(size=14),
+        axis.title.x = element_text(vjust = -1),
+        axis.title = element_text(size=16),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=14),
+        legend.key = element_rect(fill = NA),
+        plot.margin = margin(1,1,1,1.2, "cm"))
+
+
+river_asvs_plot <- river_asvs_proportions %>% filter(river == "yes", Transect != "River") %>% 
+  ggplot(aes(Cluster, Proportion*100))+
+  geom_boxplot(fill = "grey55", outlier.shape = NA) + 
+  geom_jitter(width = 0.05, height=0, size=4, aes(fill= Transect),pch=21, col="grey35") +
+  geom_text(data=letters_river, aes(Cluster, posssy, label=texty), size=6) +
+  labs(y="Relative Abundance Riverine Taxa (%)", fill="Station") +
+  # theme_cowplot()+
+  scale_fill_manual(values = myCol) +
+  theme(#legend.position = c(.15,.82), 
+        #legend.margin=margin(c(10,10,5,5)),
+        #legend.box.background = element_rect(colour = "black", size = 0.4),
+        panel.grid.major.y = element_line(color="grey45", size=0.2), 
+        panel.grid.major.x = element_blank(),
+        axis.ticks.x = element_blank(), 
+        panel.background = element_rect(fill=NA),
+        panel.border = element_rect(fill=NA,colour = "black", linewidth = 1),
+        axis.text = element_text(size=14),
+        axis.title.x = element_text(vjust = -1),
+        axis.title = element_text(size=16),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=14),
+        legend.key = element_rect(fill = NA),
+        plot.margin = margin(1,1,1,1.2, "cm"))
+
+river_asvs_plot
+
+
+# To print plot, run following in console :
+tiff(filename="~/Desktop/Desktop/Norway/Research/Writing/Trying to publish/Figures/Figure_4.tiff", units="mm", width=190, height=160, res=400)
+river_asvs_plot
+dev.off()
+```
+
+
+## Tax4Fun (Fig. 5)
+
+Marked human-related pathways from the MetaboPath (e.g. small cell lung cancer) to be removed. This included pathways related to infections. 
+
+```{r}
+# Read in the edited file and remove the the ones labeled to remove in the file
+metabo_edit <- read_csv("DNA/tax4fun/MetaboPath_redo_edit.csv") %>% 
+  filter(`Remove?`!="YES" | is.na(`Remove?`)) %>% 
+  select(-c(`Remove?`, `9-River-extra`)) %>% 
+  column_to_rownames(var="...1")
+
+# Transform to relative proportions
+relMetaboPath <-  metabo_edit %>% select(-c(1,2)) %>% t() %>% prop.table(margin = 1)*100
+
+# Keep the relevant ones for plotting
+metabo_heat <- metabo_edit %>% filter(SuperIntersting == T) %>%
+  select(-c(Interesting, SuperIntersting)) %>% 
+  t() %>% scale() %>% t() %>% as.data.frame() %>% 
+  rownames_to_column(var="Pathway") %>% 
+  separate(Pathway, into = c(NA, "Function"), sep="; ") %>% 
+  arrange(`6-River-y`) %>% 
+  mutate(Function = factor(Function, unique(Function))) %>%
+  pivot_longer(cols=c(2:53), names_to = "Sample", values_to = "Value") %>%
+  left_join(samples) %>% 
+  group_by(Cluster) %>% 
+  arrange(Value,Cluster, by_group=T) %>% 
+  mutate(SalType = ifelse(Cluster %in% c("Riverine", "Melt-Influenced"), "Freshwater", "Marine"),
+         SalType = factor(SalType, levels = c("Marine", "Freshwater")))
+
+funcs <- unique(metabo_heat$Function)[c(8,6,5,4,3,2,1,11,7,13,12,10,9)]
+
+metabo_heat$Function <- factor(metabo_heat$Function, levels = funcs)
+
+tax4fun_plot <- metabo_heat %>% ggplot(aes(Sample, Function, fill=Value)) + 
+  geom_tile() +
+  scale_fill_gradient2(low = "#00586C", mid = "#FFFFFF", high = "#B20033", midpoint = 0) +
+  facet_nested(~SalType+Cluster, scales = "free_x", space = "free",
+               strip = strip_nested(by_layer_x = T, 
+                                    size = "variable",
+                                    text_x = list(element_text(size=18, face = "italic"),
+                                                  element_text(size=12)),
+                                    background_x = list(element_rect(color ="white"),
+                                                        element_rect()))) +
+  theme_cowplot() +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks = element_blank()) +
+  labs(fill="")
+
+# To print plot, run following in console :
+tiff(filename="~/Desktop/Desktop/Norway/Research/Writing/Trying to publish/Figures/Figure_5.tiff", units="mm", width=336, height=80, res=400)
+tax4fun_plot
+dev.off()
+```
+
+### Expanded plot for SI (S9)
+```{r}
+# Keep the relevant ones for plotting
+metabo_heat_expand <- metabo_edit %>% filter(Interesting == T) %>%
+  select(-c(Interesting, SuperIntersting)) %>% 
+  t() %>% scale() %>% t() %>% as.data.frame() %>% 
+  rownames_to_column(var="Pathway") %>% 
+  separate(Pathway, into = c(NA, "Function"), sep="; ") %>% 
+  arrange(`6-River-y`) %>% 
+  mutate(Function = factor(Function, unique(Function))) %>%
+  pivot_longer(cols=c(2:53), names_to = "Sample", values_to = "Value") %>%
+  left_join(samples) %>% 
+  group_by(Cluster) %>% 
+  arrange(Value,Cluster, by_group=T) %>% 
+  mutate(SalType = ifelse(Cluster %in% c("Riverine", "Melt-Influenced"), "Freshwater", "Marine"),
+         SalType = factor(SalType, levels = c("Marine", "Freshwater")))
+
+
+metabo_heat_expand %>% ggplot(aes(Sample, Function, fill=Value)) + 
+  geom_tile() +
+  scale_fill_gradient2(low = "#00586C", mid = "#FFFFFF", high = "#B20033", midpoint = 0) +
+  facet_nested(~SalType+Cluster, scales = "free_x", space = "free",
+               strip = strip_nested(by_layer_x = T, 
+                                    size = "variable",
+                                    text_x = list(element_text(size=10, face = "italic"),
+                                                  element_text(size=8)),
+                                    background_x = list(element_rect(color ="white"),
+                                                        element_rect()))) +
+  theme_cowplot() +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.y = element_text(size=8),
+        legend.text = element_text(size=8)) +
+  labs(fill="")
+```
+
+
+## CCA 
+### Model selection
+```{r}
+# Using same variables as for the PCA with log transformed
+sed_numeric_z <- enviro_for_PCA_t_log %>% t() %>% 
+  as.data.frame() %>% 
+  rename(Perc_Phaeo = `% Phaeo`,
+         Greater_250µm = `>250µm`, 
+         Less_63µm = `<63µm`, 
+         One25_250µm = `125-250µm`, 
+         Sixty3_125µm = `63-125µm`) %>% 
+  scale() %>% # for comparability between the variables
+  as.data.frame() %>% 
+  arrange(rownames(.))
+
+# Make sample names the same format
+otu_cca <- otu_prop %>%  as.data.frame() %>%  rownames_to_column(var="Sample") %>% 
+  mutate(Sample_Code = paste(str_sub(Sample,1,1), str_sub(Sample,3,3), str_sub(Sample,9,9), sep = ".")) %>% 
+  column_to_rownames(var="Sample_Code") %>% 
+  select(-c(Sample))
+
+identical(rownames(sed_numeric_z[-3,]), rownames(otu_cca[-c(2,10,16),])) # have to remove the samples that are missing enviro or DNA data
+
+otu_cca <- otu_cca %>% slice(-c(2,10,16))
+sed_numeric_z <- sed_numeric_z %>% slice(-3)
+
+identical(rownames(sed_numeric_z), rownames(otu_cca))
+
+# Not including phaeo concentration b/c very similar to chl-a
+enviro.cca.all <- cca(otu_cca ~ Porosity + LOI_percent + `Chla (mg/m3)` + 
+                        Perc_Phaeo + One25_250µm +
+                        Sixty3_125µm + Less_63µm + Salinity + PW_Ammonium_mol +
+                        PW_Phosphate_mol + PW_Silicate_mol + 
+                        DOM_a254 + DOM_E2_E3 + DOM_Slope350_400 +
+                        Greater_250µm,
+                      data = sed_numeric_z)
+
+enviro.cca.none <- cca(otu_cca ~ 1, data = sed_numeric_z)
+
+ordistep(enviro.cca.none, enviro.cca.all, direction = "both")
+```
+
+Call: cca(formula = otu_cca ~ Salinity + Porosity + `Chla (mg/m3)` +
+Perc_Phaeo + Less_63µm + PW_Ammonium_mol + PW_Phosphate_mol + DOM_a254 + DOM_Slope350_400,
+data = sed_numeric_z)
+
+```{r}
+cca.enviro <- cca(formula = otu_cca ~ Salinity + Porosity + `Chla (mg/m3)` +
+Perc_Phaeo + PW_Ammonium_mol + PW_Phosphate_mol + One25_250µm + DOM_a254,
+data = sed_numeric_z)
+
+
+cca.enviro <- cca(formula = otu_cca ~ Salinity + Porosity + `Chla (mg/m3)` +
+Perc_Phaeo + Less_63µm + PW_Ammonium_mol + PW_Phosphate_mol + DOM_a254 + DOM_Slope350_400,
+data = sed_numeric_z)
+
+plot(cca.enviro)
+
+vif.cca(cca.enviro) # Ammonium and Chl-a are both high - remove NH4 and try again
+
+cca.enviro <- cca(formula = otu_cca ~ Salinity + Porosity + `Chla (mg/m3)` +
+Perc_Phaeo + Less_63µm  + PW_Phosphate_mol + DOM_a254 + DOM_Slope350_400,
+data = sed_numeric_z)
+
+vif.cca(cca.enviro) # better...
+
+anova.cca.enviro.terms <- anova(cca.enviro, by = "term", perm = how(nperm=999), parallel = 4)
+anova.cca.enviro.terms # all p less than 0.05 except phosphate and DOM slope - remove phosphate and check again
+
+cca.enviro <- cca(formula = otu_cca ~ Salinity + Porosity + `Chla (mg/m3)` +
+Perc_Phaeo + Less_63µm + DOM_a254 + DOM_Slope350_400,
+data = sed_numeric_z)
+
+vif.cca(cca.enviro) # looks better also - chl-a still a bit high (6.28) but ok
+
+anova.cca.enviro.terms <- anova(cca.enviro, by = "term", perm = how(nperm=999), parallel = 4)
+anova.cca.enviro.terms # all p less than 0.05 except DOM slope 0.059
+
+anova.cca.enviro <- anova.cca(cca.enviro)
+anova.cca.enviro # p=0.001 great
+
+anova.cca.enviro.axes <- anova.cca(cca.enviro, by = "axis")
+anova.cca.enviro.axes # first 6 less than 0.05
+
+summary(cca.enviro) # 43.5% explained by constrained, CCA1=36.3%, CCA2=20.1%
+```
+
+
+### Plotting CCA (Fig. 6)
+```{r}
+samples_cca <- samples %>% slice(-c(2,10,16))
+
+scores.enviro.CCA <- scores(cca.enviro, display=c("sites","cn","bp","sp")) # sites, centroids, biplot, species
+CCA.centroids <- data.frame(scores.enviro.CCA$centroids)
+CCA.sites.fjord <- data.frame(scores.enviro.CCA$sites)
+CCA.biplot.fjord <- data.frame(scores.enviro.CCA$biplot) %>% 
+  mutate(labels1 = c(-2.3, -2.1, -2.8, 0.9, -.5, -2.85, 0.5), 
+         labels2 = c(-1.1, .8, -0.41, 1.5, 1.1, 0.25, -1.8))
+rownames(CCA.biplot.fjord) <- c("Salinity", "Porosity", "Chlorophyll-a", 
+                                  "Percent Phaeopigments", "Silt/Clay Content",
+                                  "cDOM Abs 254nm", "cDOM Slope 350-400")
+CCA.species.fjord <- data.frame(scores.enviro.CCA$species) # get all OTUs
+CCA.species.fjord <- CCA.species.fjord[which(abs(CCA.species.fjord$CCA1) > 1 | abs(CCA.species.fjord$CCA2) > 1),] # filter species based on scores
+
+cluster_labels <- data.frame(clust_names = c("Riverine", "Melt-Influenced", "Pre-Melt", "Late- \nMarine", "Post-Bloom"), 
+                             CCA1 = c(1.35,1,-2.4,-0.45,-3), 
+                             CCA2 = c(0.6,-.3,-2,0.65,2.2))
+```
+
+
+```{r}
+plot.enviro.CCA <- ggplot(CCA.sites.fjord, aes(x = CCA1, y = CCA2)) +
+  geom_hline(yintercept=0, linetype="dotted") +
+  geom_vline(xintercept=0, linetype="dotted") +
+  #geom_point(data = CCA.species.fjord,
+             # aes(x = CCA1*1, y = CCA2*1),
+             # col = "grey45",
+             # shape = 3,
+             # size = 2) + 
+  stat_ellipse(aes(group=samples_cca$Cluster), geom = "polygon", alpha=0.2, col="grey50", linewidth=0.3, level = 0.95)+
+  geom_point(aes(x = CCA1, y = CCA2,
+                 fill = samples_cca$Transect,
+                 pch = samples_cca$Month_n),
+             size = 6, 
+             col="white") +
+  scale_colour_manual(values = myCol) +
+  scale_fill_manual(values = myCol) +
+  scale_shape_manual(values = c(21,24,22,23,25)) +
+  # geom_path(data=df_ell, aes(x=CCA1, y=CCA2, group=group),
+  #           size=1, linetype=2,
+  #           color="slategrey") +
+  geom_segment(data = CCA.biplot.fjord,
+               aes(x = 0, xend = CCA1*2.5, y = 0, yend = CCA2*2.5),
+               arrow=arrow(length=unit(0.01,"npc")),
+               color = "#A40F36",
+               size = .5) +
+  geom_label(data = CCA.biplot.fjord,
+            aes(x = labels1, y = labels2, label=rownames(CCA.biplot.fjord)), #c("Temperature","Secchi depth","DOC","POC d13C","Chl a","SUVA 254")), # label = rownames(CCA.biplot.fjord)
+            size = 5,
+            color = "#A40F36") +
+  geom_text(data=cluster_labels, aes(CCA1, CCA2, label=clust_names),
+            fontface="bold.italic",
+            size=5, 
+            hjust=0,
+            col="grey30") +
+  
+  #geom_text(data = CCA.species.fjord,
+           # aes(x = CCA1*5, y = CCA2*5, label = as.data.frame(tax_table(ps_hel_CCA))[rownames(CCA.species.fjord), 6]), # Add a multiplicating factor to see the species
+         #   size = 3,
+          #  color = "grey45") +
+  labs(color = "Station", shape = "Month", fill = "Station", 
+       x = "CCA1 36.3%",
+       y = "CCA2 20.1%",
+       size = 8) +
+  guides(linetype = "none") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank(),
+        text = element_text(size = 25),
+        legend.background = element_blank(),
+        #legend.box.background= element_rect(colour="black"),
+        #legend.position = c(0.1,0.23), 
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=14)) +
+  coord_fixed() +
+  xlim(-4,3) +
+  scale_y_continuous(breaks = c(-4,-3,-2,-1,0,1,2)) +
+  guides(shape=guide_legend(order=2, override.aes = list(col="black", size=5)), 
+         fill=guide_legend(order=1, override.aes = list(pch=21, size=5)))
+plot.enviro.CCA
+
+# To print plot, run following in console :
+tiff(filename="~/Desktop/Desktop/Norway/Research/Writing/Trying to publish/Figures/Figure_6.tiff", units="mm", width=250, height=240, res=400)
+plot.enviro.CCA
+dev.off()
+```
+
+## RDA with Hellinger transformed ASV data (S10a)
+```{r}
+ps_hel_wspc <- transform(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool, transform = "hellinger")
+
+hell_otu_wspc <- as.data.frame(otu_table(ps_hel_wspc)) %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="Sample") %>% 
+  mutate(Sample_Code = paste(str_sub(Sample,1,1), str_sub(Sample,3,3), str_sub(Sample,9,9), sep = ".")) %>% 
+  column_to_rownames(var="Sample_Code") %>% 
+  select(-c(Sample)) %>% 
+  slice(-c(2,10,16,47))
+
+identical(rownames(sed_numeric_z), rownames(hell_otu_wspc))
+
+
+rda.hell <- rda(formula = hell_otu_wspc ~ Salinity + Porosity + `Chla (mg/m3)` +
+Perc_Phaeo + Less_63µm + DOM_a254 + DOM_Slope350_400,
+data = sed_numeric_z)
+
+summary(rda.hell) #53.9% explained by constrained, RDA1=52.7%, RDA2=32.4%
+
+vif.cca(rda.hell) # okay, chl-a little high
+
+anova.rda <- anova.cca(rda.hell) # p=0.001
+
+anova.rda.terms <- anova.cca(rda.hell, by="term") # most significant DOM 245 and DOM slope not
+
+anova.rda.axes <- anova.cca(rda.hell, by="axis")
+
+plot(rda.hell, display = c("wa", "bp"))
+```
+
+```{r}
+scores.hell.RDA <- scores(rda.hell, display=c("sites","cn","bp","sp")) # sites, centroids, biplot, species
+RDA.sites.fjord.hell <- data.frame(scores.hell.RDA$sites)
+RDA.biplot.fjord.hell <- data.frame(scores.hell.RDA$biplot)
+rownames(RDA.biplot.fjord.hell) <- c("Salinity", "Porosity", "Chlorophyll-a", 
+                                  "Phaeopigments (%)", "Silt/Clay (%)",
+                                  "cDOM Abs 254nm", "cDOM Slope 350-400")
+RDA.species.fjord.hell <- data.frame(scores.hell.RDA$species) # get all OTUs
+RDA.species.fjord.hell <- RDA.species.fjord[which(abs(RDA.species.fjord$RDA1) > 0.07 | abs(RDA.species.fjord$RDA2) > 0.07),] # filter species based on scores
+
+plot.hell.RDA <- ggplot(RDA.sites.fjord.hell, aes(x = RDA1, y = RDA2)) +
+  geom_hline(yintercept=0, linetype="dotted") +
+  geom_vline(xintercept=0, linetype="dotted") +
+  geom_point(aes(x = RDA1, y = RDA2,
+                 fill = factor(samples_cca$Station, levels=c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River")),
+                 shape = factor(samples_cca$Month_n, levels = c("May", "June", "July", "August", "September"))),
+             size = 6, 
+             col="white") +
+  geom_point(aes(x = RDA1, y = RDA2,
+                 col=factor(samples_cca$Station, levels=c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River")), 
+                 shape = factor(samples_cca$Month_n, levels = c("May", "June", "July", "August", "September"))), 
+             size=3.8) +
+  scale_colour_manual(values = myCol) +
+  scale_fill_manual(values = myCol) +
+  scale_shape_manual(values = c(21,24,22,23,25)) +
+  
+  geom_segment(data = RDA.biplot.fjord.hell,
+               aes(x = 0, xend = RDA1, y = 0, yend = RDA2),
+               arrow=arrow(length=unit(0.01,"npc")),
+               color = "#A40F36") +
+  geom_text(data = RDA.biplot.fjord.hell,
+            aes(x = RDA1*1.1, y = RDA2*1.1, label=rownames(RDA.biplot.fjord.hell)), #c("Temperature","Secchi depth","DOC","POC d13C","Chl a","SUVA 254")), # label = rownames(RDA.biplot.fjord)
+            size = 5,
+            color = "#A40F36") +
+  
+  #geom_text(data = RDA.species.fjord,
+           # aes(x = RDA1*5, y = RDA2*5, label = as.data.frame(tax_table(ps_hel_rda))[rownames(RDA.species.fjord), 6]), # Add a multiplicating factor to see the species
+         #   size = 3,
+          #  color = "grey45") +
+  labs(color = "Transect", shape = "Month", fill = "Transect", 
+       x = "RDA1 52.7%",
+       y = "RDA2 32.4%") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank(),
+        legend.background = element_blank(),
+        legend.box.background= element_rect(colour="black"),
+        legend.position = "none", 
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15)) +  #c(0.125,0.21)
+  coord_fixed() +
+  xlim(-1.3,.7)
+plot.hell.RDA
+```
+
+
+
+## RDA with clr transformed data (S10b)
+```{r}
+ps_clr_wspc <- transform(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool, transform = "clr")
+
+clr_otu_wspc <- as.data.frame(otu_table(ps_clr_wspc)) %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="Sample") %>% 
+  mutate(Sample_Code = paste(str_sub(Sample,1,1), str_sub(Sample,3,3), str_sub(Sample,9,9), sep = ".")) %>% 
+  column_to_rownames(var="Sample_Code") %>% 
+  select(-c(Sample)) %>% 
+  slice(-c(2,10,16,47))
+
+identical(rownames(sed_numeric_z), rownames(clr_otu_wspc))
+
+
+rda.clr <- rda(formula = clr_otu_wspc ~ Salinity + Porosity + `Chla (mg/m3)` +
+Perc_Phaeo + Less_63µm + DOM_a254 + DOM_Slope350_400,
+data = sed_numeric_z)
+
+summary(rda.clr) #46.2% explained by constrained, RDA1=53.6%, RDA2=17.4%
+
+vif.cca(rda.clr) # okay, chl-a little high
+
+anova.rda <- anova.cca(rda.clr) # p=0.001
+
+anova.rda.terms <- anova.cca(rda.clr, by="term") # most significant DOM 245 and DOM slope not
+
+anova.rda.axes <- anova.cca(rda.clr, by="axis")
+
+plot(rda.clr, display = c("wa", "bp"))
+```
+
+```{r}
+scores.clr.RDA <- scores(rda.clr, display=c("sites","cn","bp","sp")) # sites, centroids, biplot, species
+RDA.sites.fjord.clr <- data.frame(scores.clr.RDA$sites)
+RDA.biplot.fjord.clr <- data.frame(scores.clr.RDA$biplot)
+rownames(RDA.biplot.fjord.clr) <- c("Salinity", "Porosity", "Chlorophyll-a", 
+                                  "Phaeopigments (%)", "Silt/Clay (%)",
+                                  "cDOM Abs 254nm", "cDOM Slope 350-400")
+RDA.species.fjord.clr <- data.frame(scores.clr.RDA$species) # get all OTUs
+RDA.species.fjord.clr <- RDA.species.fjord[which(abs(RDA.species.fjord$RDA1) > 0.07 | abs(RDA.species.fjord$RDA2) > 0.07),] # filter species based on scores
+
+plot.clr.RDA <- ggplot(RDA.sites.fjord.clr, aes(x = RDA1, y = RDA2)) +
+  geom_hline(yintercept=0, linetype="dotted") +
+  geom_vline(xintercept=0, linetype="dotted") +
+  geom_point(aes(x = RDA1, y = RDA2,
+                 fill = factor(samples_cca$Station, levels=c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River")),
+                 shape = factor(samples_cca$Month_n, levels = c("May", "June", "July", "August", "September"))),
+             size = 6, 
+             col="white") +
+  geom_point(aes(x = RDA1, y = RDA2,
+                 col=factor(samples_cca$Station, levels=c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River")), 
+                 shape = factor(samples_cca$Month_n, levels = c("May", "June", "July", "August", "September"))), 
+             size=3.8) +
+  scale_colour_manual(values = myCol) +
+  scale_fill_manual(values = myCol) +
+  scale_shape_manual(values = c(21,24,22,23,25)) +
+  
+  geom_segment(data = RDA.biplot.fjord.clr,
+               aes(x = 0, xend = RDA1*4, y = 0, yend = RDA2*4),
+               arrow=arrow(length=unit(0.01,"npc")),
+               color = "#A40F36") +
+  geom_text(data = RDA.biplot.fjord.clr,
+            aes(x = RDA1*4.1, y = RDA2*4.1, label=rownames(RDA.biplot.fjord.clr)), #c("Temperature","Secchi depth","DOC","POC d13C","Chl a","SUVA 254")), # label = rownames(RDA.biplot.fjord)
+            size = 5,
+            color = "#A40F36") +
+  
+  #geom_text(data = RDA.species.fjord,
+           # aes(x = RDA1*5, y = RDA2*5, label = as.data.frame(tax_table(ps_hel_rda))[rownames(RDA.species.fjord), 6]), # Add a multiplicating factor to see the species
+         #   size = 3,
+          #  color = "grey45") +
+  labs(color = "Transect", shape = "Month", fill = "Transect", 
+       x = "RDA1 53.6%",
+       y = "RDA2 17.4%") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank(),
+        legend.background = element_blank(),
+        legend.box.background= element_rect(colour="black"),
+        legend.position = "right", 
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=15)) +  #c(0.125,0.21)
+  coord_fixed()
+plot.clr.RDA
+```
+
+### RDAs together
+```{r}
+# To print plot, run following in console :
+tiff(filename="~/Desktop/Desktop/Norway/Research/Writing/Trying to publish/Figures/Supp_9.tiff", units="mm", width=160, height=350, res=300)
+plot_grid(plot.hell.RDA, plot.clr.RDA, labels = "AUTO", nrow=2)
+dev.off()
+```
+
+
+## Alpha diversity (S7)
+Rarefied
+```{r}
+ps_rarefied_wspc <- rarefy_even_depth(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool, sample.size = min(sample_sums(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool)),
+                  rngseed = 587, replace = TRUE, trimOTUs = TRUE, verbose = TRUE)
+
+
+diversity_rare <- estimate_richness(ps_rarefied_wspc, 
+                                     measure = c("Shannon", "Observed", "Chao1","ACE", "InvSimpson", "Fisher")) %>% 
+  rownames_to_column(var="Sample") %>% 
+  mutate(Sample = str_sub(Sample, 2, length(Sample)), 
+         Sample = str_replace_all(Sample, "\\.", "-")) %>% 
+  filter(Sample != "9-River-extra") %>% 
+  mutate(H_max = log(Shannon), 
+         Pielous = Shannon / H_max) %>% 
+  left_join(samples) %>% 
+  mutate(Sal = ifelse(Transect %in% c("Fjord", "Subtidal"), "Marine", "Fresh"))
+
+
+
+diversity_rare_medians <- diversity_rare %>% group_by(Transect, Month) %>%
+  summarise(across(where(is.numeric), median))
+
+diversity_rare_long <- diversity_rare %>% rename("InvSimp"="InvSimpson") %>% 
+  pivot_longer(cols = c(Shannon, Observed, Chao1, Pielous, ACE, InvSimp), names_to = "Metric", values_to = "Values")
+
+div.rare.plot <- diversity_rare_long %>%  
+  ggplot(aes(Transect, Values)) + 
+  geom_boxplot(alpha=1, outlier.shape = NA, aes(fill=Transect)) +
+  geom_jitter(width=0.1, height=0, aes(pch=factor(Month)), size=2, alpha=0.8, fill="black") +
+  facet_wrap(~factor(Metric, levels = unique(Metric)[c(2,3,5,4,1,6)]), 
+             nrow = 1, scales = "free") +
+  theme_cowplot() +
+  scale_fill_brewer(palette="BrBG", direction =-1) +
+  scale_shape_manual(values = c(21,24,22,23,25), labels = c("May", "June", "July", "Aug", "Sept")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1), 
+        text = element_text(size = 12),
+        panel.grid.major.y = element_line(color="grey65", size = .3),
+        axis.title = element_blank(), 
+        panel.spacing = unit(1,"cm")) +
+  labs(fill="Station", pch="Month", title="A) Rarefied")
+```
+
+Standardized
+```{r}
+total <- median(sample_sums(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool))
+standf <- function(x, t=total) round(t * (x / sum(x)))
+ps_stand_wspc <- transform_sample_counts(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool, standf)
+
+
+diversity_stand <- estimate_richness(ps_stand_wspc, 
+                                     measure = c("Shannon", "Observed", "Chao1","ACE", "InvSimpson", "Fisher")) %>% 
+  rownames_to_column(var="Sample") %>% 
+  mutate(Sample = str_sub(Sample, 2, length(Sample)), 
+         Sample = str_replace_all(Sample, "\\.", "-")) %>% 
+  filter(Sample != "9-River-extra") %>% 
+  mutate(H_max = log(Shannon), 
+         Pielous = Shannon / H_max) %>% 
+  left_join(samples)
+
+diversity_stand_medians <- diversity_stand %>% group_by(Transect, Month) %>%
+  summarise(across(where(is.numeric), median))
+
+diversity_stand_long <- diversity_stand %>% rename("InvSimp"="InvSimpson") %>% 
+  pivot_longer(cols = c(Shannon, Observed, Chao1, Pielous, ACE, InvSimp), names_to = "Metric", values_to = "Values")
+
+div.stand.plot <- diversity_stand_long %>% filter(Values<20000) %>% 
+  ggplot(aes(Transect, Values)) + 
+  geom_boxplot(alpha=1, outlier.shape = NA, aes(fill=Transect)) +
+  geom_jitter(width=0.1, height=0, aes(pch=factor(Month)), size=2, alpha=0.8, fill="black") +
+  facet_wrap(~factor(Metric, levels = unique(Metric)[c(2,3,5,4,1,6)]), 
+             nrow = 1, scales = "free") +
+  theme_cowplot() +
+  scale_fill_brewer(palette="BrBG", direction =-1) +
+  scale_shape_manual(values = c(21,24,22,23,25), labels = c("May", "June", "July", "Aug", "Sept")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1), 
+        text = element_text(size = 12),
+        panel.grid.major.y = element_line(color="grey65", size = .3),
+        axis.title = element_blank(), 
+        panel.spacing = unit(1,"cm")) +
+  labs(fill="Station", pch="Month", title="B) Standardized")
+```
+
+Non-normalized
+```{r}
+diversity_no_normal <- estimate_richness(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool, 
+                                    measure = c("Shannon", "Observed", "Chao1","ACE", "InvSimpson", "Fisher")) %>% 
+  rownames_to_column(var="Sample") %>% 
+  mutate(Sample = str_sub(Sample, 2, length(Sample)), 
+         Sample = str_replace_all(Sample, "\\.", "-")) %>% 
+  filter(Sample != "9-River-extra") %>% 
+  mutate(H_max = log(Shannon), 
+         Pielous = Shannon / H_max) %>% 
+  left_join(samples)
+
+diversity_no_normal_medians <- diversity_no_normal %>% group_by(Transect, Month) %>%
+  summarise(across(where(is.numeric), median))
+
+diversity_no_normal_long <- diversity_no_normal %>% 
+  rename("InvSimp"="InvSimpson") %>% 
+  pivot_longer(cols = c(Shannon, Observed, Chao1, Pielous, ACE, InvSimp), names_to = "Metric", values_to = "Values")
+
+div.no.normal.plot <- diversity_no_normal_long %>%  
+  ggplot(aes(Transect, Values)) + 
+  geom_boxplot(alpha=1, outlier.shape = NA, aes(fill=Transect)) +
+  geom_jitter(width=0.1, height=0, aes(pch=factor(Month)), size=2, alpha=0.8, fill="black") +
+  facet_wrap(~factor(Metric, levels = unique(Metric)[c(2,3,5,4,1,6)]), 
+             nrow = 1, scales = "free") +
+  theme_cowplot() +
+  scale_fill_brewer(palette="BrBG", direction =-1) +
+  scale_shape_manual(values = c(21,24,22,23,25), labels = c("May", "June", "July", "Aug", "Sept")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1), 
+        text = element_text(size = 12),
+        panel.grid.major.y = element_line(color="grey65", size = .3),
+        axis.title = element_blank(), 
+        panel.spacing = unit(1,"cm")) +
+  labs(fill="Station", pch="Month", title="C) Non-Normalized")
+```
+
+Final plot
+```{r}
+plot_grid(div.rare.plot+theme(axis.text.x = element_blank(), legend.position = "none"), 
+          div.stand.plot+theme(axis.text.x = element_blank(), legend.position = "none"),
+          div.no.normal.plot+theme(legend.position = "bottom"), 
+          nrow=3, rel_heights = c(1,1,1.5))
+```
+
+## Ven Diagram of ASVs (S8)
+```{r}
+library(MicrobiotaProcess)
+library(VennDiagram)
+
+mpse_rare <- as.MPSE(ps_rarefied_wspc)
+
+mp_venn <- mp_cal_venn(mpse_rare, action = "only", .group = station)
+
+otu_delta <- mp_venn$vennOfstation[[1]]
+otu_fjord <- mp_venn$vennOfstation[[2]]
+otu_river <- mp_venn$vennOfstation[[3]]
+otu_shelf <- mp_venn$vennOfstation[[4]]
+
+myCol_venn <- c("#018571", "#A6611A", "#80CDC1", "#DFC27D")
+
+# right order
+venn.diagram(
+  x = list(otu_fjord, otu_river, otu_delta,  otu_shelf),
+  category.names = c("Fjord", "River", "Subtidal" , "Intertidal"),
+  cat.fontfamily = "sans",
+  cat.fontface = "bold",
+  cat.cex = 1.7,
+  filename = 'venn_diagramm_pooled.png',
+  fill=myCol_venn,
+  col=myCol_venn,
+  cex = sqrt(sqrt(c(249,303,432,
+          692,911,850,456,468,
+          1312,158,162,94,175,468,60)))/3, 
+  fontfamily = "sans"
+)
+```
+
+## Indicator Taxa
+```{r}
+library(indicspecies)
+
+inv <-  multipatt(otu_prop, samples$Clade, # to remove 9-River-extra
+                   func = "IndVal.g", control = how(nperm=9999), 
+                   duleg = T)
+
+summary(inv, alpha = 0.005, minstat=sqrt(0.7), indvalcomp = T)
+
+indisp.sign<-as.data.frame(inv$sign, keep.rownames=TRUE) %>% 
+  mutate(p.value.bh = p.adjust(p.value, method="BH")) %>% 
+  filter(p.value.bh <= 0.001, 
+         stat > 0.7) %>% 
+  mutate(Clade = factor(index, labels = c("I", "LM", "PoB", "PrM", "R"))) %>% 
+  select(-c(1:6)) %>% 
+  rownames_to_column(var="OTU_number")
+
+all_taxa <- tax_table(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool) %>% as.data.frame %>% 
+  replace_na(list(Phylum="Unknown Phylum", Class="Unknown Class", Order="Unknown Order",Family="Unknown Family", Genus="Unknown Genus")) %>% 
+  mutate(Species = ifelse(is.na(Species), Species, paste(Genus, Species, sep = " ")), 
+         all = paste(Kingdom, Phylum, Class, Order, Family, Genus, Species, sep = ";"), 
+         all = paste(all, ";", sep=""), 
+         all = str_replace(all, ";NA;", ";"))  %>% 
+  rownames_to_column(var ="OTU_number")
+
+
+clade_otu <- otu_prop %>% as.data.frame() %>% 
+  rownames_to_column(var="Sample") %>% 
+  left_join(samples) %>% 
+  group_by(Clade) %>%
+  select(-c(Month)) %>% 
+  summarise(across(where(is.numeric), mean)) %>%
+  column_to_rownames(var="Clade") %>% 
+  t() %>% as.data.frame() %>% 
+  rownames_to_column(var = "OTU_number") %>% 
+  left_join(all_taxa)
+
+
+cutoff <- 0.005
+indic_intertidal <- indisp.sign %>% filter(Clade == "I") %>% left_join(clade_otu) %>% filter(Intertidal >= cutoff)
+indic_late_marine <- indisp.sign %>% filter(Clade == "LM") %>% left_join(clade_otu) %>% filter(`Late-Marine` >= cutoff)
+indic_post_bloom <- indisp.sign %>% filter(Clade == "PoB") %>% left_join(clade_otu) %>% filter(`Post-Bloom` >= cutoff)
+indic_pre_melt <- indisp.sign %>% filter(Clade == "PrM") %>% left_join(clade_otu) %>% filter(`Pre-Melt` >= cutoff)
+indic_river <- indisp.sign %>% filter(Clade == "R") %>% left_join(clade_otu) %>% filter(River >= cutoff)
+
+all_indics <- full_join(indic_intertidal, indic_late_marine) %>% 
+  full_join(indic_post_bloom) %>% full_join(indic_pre_melt) %>% 
+  full_join(indic_river) %>% 
+  select(OTU_number, Clade)
+
+
+indic_prop <- otu_prop %>% as.data.frame %>% select(all_indics$OTU_number)
+indic_enviro <- sediment_environmental %>% arrange(Sample_Code) %>%
+  filter(!Sample_Code %in% c("5.S.x", "7.D.z", "9.R.extra")) %>% 
+  select(where(is.numeric)) %>% 
+  select(-c(Station_Depth, PW_Silicate, PW_Phosphate, PW_Nitrite_Nitrate, PW_Ammonium, DOM_a375, DOM_a365, DOM_a250, Bulk_density))
+```
+
+### Plot correlation of indicator taxa with environmental variables (S11)
+```{r}
+library(Hmisc)
+
+corr.matrix <- rcorr(x = as.matrix(indic_prop), y = as.matrix(indic_enviro), type = "spearman")
+str(corr.matrix)
+names.envar <- colnames(indic_enviro) # Names of the environmental variables
+corr.matrix.r <- corr.matrix$r[all_indics$OTU_number,names.envar] # dim 21 x 20
+corr.matrix.p <- corr.matrix$P[all_indics$OTU_number,names.envar]
+corr.matrix.n <- corr.matrix$n[all_indics$OTU_number,names.envar]
+
+corr.matrix.p.adjust <- data.frame()
+
+for (i in 1:nrow(corr.matrix.p)){
+  for (j in 1:ncol(corr.matrix.p)){
+    corr.matrix.p.adjust[i,j] <- p.adjust(corr.matrix.p[i,j], method = "BH", corr.matrix.n[i,j])
+  }
+}
+
+corr.matrix.p.adjust<- as.matrix(corr.matrix.p.adjust)
+rownames(corr.matrix.p.adjust) <- rownames(corr.matrix.r)
+colnames(corr.matrix.p.adjust) <- colnames(corr.matrix.r)
+
+
+# Set non significative r values to 0
+corr.matrix.r.adjust <- matrix(data = 0, nrow = nrow(corr.matrix.r), ncol = ncol(corr.matrix.r))
+rownames(corr.matrix.r.adjust) <- rownames(corr.matrix.r)
+colnames(corr.matrix.r.adjust) <- colnames(corr.matrix.r)
+
+corr.matrix.r.adjust[which(corr.matrix.p.adjust <= 0.05)] <- corr.matrix.r[which(corr.matrix.p.adjust <= 0.05)]
+
+rownames(corr.matrix.r.adjust) <- rownames(corr.matrix.r)
+colnames(corr.matrix.r.adjust) <- colnames(corr.matrix.r)
+
+
+
+corr.Heatmap <- as.data.frame(corr.matrix.r.adjust) %>% 
+  rownames_to_column(var="OTU_number") %>% 
+  pivot_longer(cols = c(2:ncol(.)), names_to = "Envar", values_to = "Values") %>% full_join(all_indics) %>% 
+  left_join(all_taxa) %>% 
+  rename("Taxa" = "OTU_number") %>% 
+  mutate(Cluster = factor(Clade, levels=c("PoB", "LM", "PrM", "I", "R"),  labels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "Melt-Influenced", "Riverine")), 
+         Genus = ifelse(Genus == "Unknown Genus", Family, Genus)) %>% filter(Genus != "Unknown Family")
+  
+
+corr.insig.heatmap <- as.data.frame(corr.matrix.r) %>% 
+  rownames_to_column(var="OTU_number") %>% 
+  pivot_longer(cols = c(2:ncol(.)), names_to = "Envar", values_to = "Values") %>% full_join(all_indics) %>% 
+  left_join(all_taxa) %>% 
+  rename("Taxa" = "OTU_number") %>% 
+  mutate(Cluster = factor(Clade, levels=c("PoB", "LM", "PrM", "I", "R"),  labels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "Melt-Influenced", "Riverine")), 
+         Genus = ifelse(Genus == "Unknown Genus", Family, Genus)) %>% filter(Genus != "Unknown Family")
+
+heat_x_labels <- all_indics %>% left_join(all_taxa[,c(1,6:8)])
+
+
+plot.Heatmap.corr <- ggplot(data = corr.Heatmap) +
+  geom_tile(aes(x = Taxa, y = Envar, fill = Values), color = "#6A6A6A", linetype = "dashed", size = 0.25) +
+  scale_x_discrete(breaks=heat_x_labels$OTU_number, labels=heat_x_labels$Genus) +
+  scale_fill_gradient2(high = "#00586C", mid = "#FFFFFF", low = "#6C0000") +
+  labs(fill = "Adjusted Spearman rho", x = element_blank(), y = element_blank()) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=60, hjust = 1, color = "black", size = 10),
+        axis.text.y = element_text(colour="black", size = 14),
+        panel.grid = element_blank()) +
+  facet_grid(~Cluster, scales="free_x", space = "free")
+
+
+corr.heatmap.cleaned <- corr.Heatmap %>% group_by(Cluster, Envar, Genus) %>% summarise(Values=mean(Values), n=n()) %>% mutate(Genus_n = ifelse(n>1, paste(Genus, " (n=", n, ")", sep = ""), Genus)) %>% filter(!Envar %in% c("500µm-1mm", "250-500µm", "1-2mm", ">2mm", "DOM_Slope275_295", "DOM_SR", "63-250µm", "Phaeo")) %>%   mutate(Type = ifelse(Envar %in% c("Sediment_temp", ">250µm","125-250µm","63-125µm", 
+                                       "<63µm", "Porosity", "LOI_percent"), "Sediment Characteristics", "Porewater Chemistry"),
+         Type = ifelse(Envar %in% c("Chla (mg/m3)", "% Phaeo",
+                                       "DOM_a254", "DOM_E2_E3",
+                                       "DOM_Slope350_400"), 
+                       "OM Quality", Type), 
+         Envar = factor(Envar, levels = c("Sediment_temp", ">250µm","125-250µm","63-125µm", 
+                                                "<63µm", "Porosity", "LOI_percent",
+                                                "Salinity", "PW_Phosphate_mol",
+                                                "PW_Ammonium_mol", "PW_Silicate_mol", 
+                                                "PW_Nitrite_Nitrate_mol", 
+                                                "Chla (mg/m3)", "% Phaeo", 
+                                                "DOM_a254", "DOM_E2_E3", 
+                                                "DOM_Slope350_400"), 
+                           labels = c("Sediment Temperature", ">250µm (%)","125-250µm (%)","63-125µm (%)",
+                                      "<63µm (%)", "Porosity", "LOI (%)",
+                                      "Salinity (PSU)", "Phosphate (µmol/L)",
+                                      "Ammonium (µmol/L)", "Silicate (µmol/L)",
+                                      "Nitrite and Nitrate (µmol/L)", 
+                                      "Chl-a (µg/L)", "Phaeopigments (%)",
+                                      "DOM abs 254nm", "DOM E2/E3", 
+                                      "DOM Slope 350-400"))) %>% 
+  filter(Envar != "Sediment Temperature") 
+  
+plot.Heatmap.corr <- corr.heatmap.cleaned %>% ungroup() %>% 
+  mutate(Cluster = factor(Cluster, labels = c("Post-Bloom", "Late-Marine", "Pre-Melt", "M-I", "Riverine"))) %>% 
+  ggplot() +
+  geom_tile(aes(x = Genus_n, y = factor(Envar, levels = rev(levels(Envar))), fill = Values), color = "#6A6A6A", linetype = "dashed", size = 0.25, stat = "sum") +
+  scale_fill_gradient2(low = "#005893", mid = "#FFFFFF", high = "#6C0000") +
+  labs(fill = "Adjusted \nSpearman rho", x = element_blank(), y = element_blank()) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=60, hjust = 1, color = "black", size = 10),
+        axis.text.y = element_text(colour="black", size = 11),
+        panel.grid = element_blank(), 
+        strip.text.x = element_text(size=12), 
+        strip.text.y = element_text(size=8, color = "grey35")) +
+  facet_grid(factor(Type, levels = unique(Type)[c(2,3,1)])~Cluster, scales="free", space = "free", switch = "y") +
+    theme(strip.placement = "outside")
+
+plot.Heatmap.corr
+
+```
+
+
+
+# Plotting Plate Data
+## Boxplot of number of substrates used (Fig. 7)
+```{r}
+plate_metrics_by_plate <- read_csv("Plate Data/plate_metrics_by_plate.csv")
+plate_metrics_by_plate$transect <- factor(plate_metrics_by_plate$transect, levels=c("Fjord", "Subtidal", "Intertidal", "River"))
+plate_metrics_by_plate$salinity <- factor(plate_metrics_by_plate$salinity, levels=c("Marine", "Brackish", "Fresh"))
+
+sal_cols <- c("#CEB7A7", "#C1D5CA", "#C2FFF9")
+
+
+plate_box <- plate_metrics_by_plate %>% ggplot(aes(salinity, sub_rich)) + 
+  geom_boxplot(color="black", aes(fill=salinity), outlier.shape = NA) +
+  geom_point(size=3, aes(pch=factor(month)), fill="black") + 
+  facet_grid(~transect, scales = "free_x", space = "free") + 
+  scale_color_brewer(palette = "BrBG", direction=-1, labels = c("June", "July", "August", "September")) +
+  #scale_color_manual(values=c("#948E4D", "#6D5D36", "#47381F", "#516E6A"), labels = c("June", "July", "August", "September")) + 
+  scale_shape_manual(values = c(24,22,23,25), 
+                    labels = c("June", "July", "Aug", "Sept")) +
+  guides(shape = guide_legend(override.aes = list(size=2))) +
+  scale_fill_manual(values=c("Fresh" = sal_cols[1], "Brackish" = sal_cols[2], "Marine" = sal_cols[3]), 
+                    guide = guide_legend(override.aes = list(shape=NA))) +
+  labs(shape = "Month", color = "Station",fill="Salinity of \nSuspension \nWater", y = "Number of Substrates Used", x = "", title= "") +
+  guides(color="none") +
+  theme_cowplot() + 
+  theme(panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank(), 
+        plot.title = element_text(hjust = 0.5),
+        panel.grid.major.y = element_line(color="grey55", size = 0.3), 
+        panel.grid.minor.y = element_line(color="grey55", size = 0.2),
+        panel.spacing = unit(0.5, "lines"), 
+        strip.text = element_text(face = "bold", size=18), 
+        panel.border = element_rect(color="black")) + 
+scale_y_continuous(limits=c(0,31), expand = c(0,0), breaks = seq(0,30, by = 10))
+
+# To print plot, run following in console :
+tiff(filename="~/Desktop/Desktop/Norway/Research/Writing/Trying to publish/Figures/Figure_7.tiff", units="mm", width=228, height=110, res=400)
+plate_box
+dev.off()
+```
+
+## Boxplots switch faceting
+```{r}
+plate_metrics_by_plate %>% 
+  ggplot(aes(transect, sub_rich)) + 
+  geom_boxplot(color="black", aes(fill=transect),
+               outlier.shape = NA) +
+  geom_jitter(size=3, #aes(pch=factor(month)), 
+             fill="black", 
+             width = 0.05) + 
+  facet_grid(~salinity, scales = "free_x", 
+             space = "free") +
+  scale_shape_manual(values = c(24,22,23,25), 
+                    labels = c("June", "July", "Aug", "Sept")) +
+  guides(shape = guide_legend(override.aes = list(size=2))) +
+  scale_fill_manual(values=myCol, 
+                    guide = guide_legend(override.aes = list(shape=NA))) +
+  labs(shape = "Month", color = "Station",fill="Salinity of \nSuspension \nWater", y = "Number of Substrates Used", x = "Station", title= "Treatment Water") +
+  guides(color="none") +
+  theme_cowplot() + 
+  theme(panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank(), 
+        plot.title = element_text(hjust = 0.5),
+        panel.grid.major.y = element_line(color="grey55", size = 0.3), 
+        panel.grid.minor.y = element_line(color="grey55", size = 0.2),
+        panel.spacing = unit(0.5, "lines"), 
+        strip.text = element_text(face = "bold", size=15), 
+        panel.border = element_rect(color="black"),
+        axis.text.x = element_blank(), 
+        legend.position = "none") + 
+scale_y_continuous(limits=c(0,31), expand = c(0,0), breaks = seq(0,30, by = 10))
+```
+
+
+## Boxplots of all the metrics (S13)
+```{r}
+div_long_plates <-  plate_metrics_by_plate %>% mutate(InvE = 1/E) %>% 
+  select(month, transect, salinity, awcd, H, InvE) %>% 
+  rename("Shannon" = "H", "Inv Simpson" = "InvE", "AWCD" = "awcd") %>% 
+  pivot_longer(cols=c(4:6), names_to = "Metric", values_to = "Value")
+
+
+
+div_long_plates %>% ggplot(aes(salinity, Value)) + 
+  geom_boxplot(color="black", aes(fill=salinity), outlier.shape = NA) +
+  geom_point(size=3, aes(pch=factor(month)), fill="black") + 
+  facet_grid(Metric~transect, scales = "free", space = "free_x", switch="y") + 
+  #scale_color_manual(values=c("#948E4D", "#6D5D36", "#47381F", "#516E6A"), labels = c("June", "July", "August", "September")) + 
+  scale_shape_manual(values = c(24,22,23,25), 
+                    labels = c("June", "July", "Aug", "Sept")) +
+  guides(shape = guide_legend(override.aes = list(size=2))) +
+  scale_fill_manual(values=c("Fresh" = sal_cols[1], "Brackish" = sal_cols[2], "Marine" = sal_cols[3]), 
+                    guide = guide_legend(override.aes = list(shape=NA))) +
+  labs(shape = "Month", color = "Station",fill="Salinity of \nSuspension \nWater", y = "", x = "", title= "") +
+  guides(color="none") +
+  theme_cowplot() + 
+  theme(panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank(), 
+        plot.title = element_text(hjust = 0.5),
+        panel.grid.major.y = element_line(color="grey80", size = 0.3), 
+        panel.grid.minor.y = element_line(color="grey85", size = 0.2),
+        strip.text = element_text(face = "bold", size=15), 
+        panel.border = element_rect(color="black"),
+        strip.placement = "outside",
+        strip.background.y = element_blank(),
+        panel.spacing.y = unit(1, "cm"))
+
+```
+
+
+## Heatmap with substrate details (S14)
+```{r}
+plate_metrics_by_substrate <- read_csv("Plate Data/plate_metrics_by_substrate.csv")
+plate_metrics_by_substrate$transect <- factor(plate_metrics_by_substrate$transect, levels=c("Fjord", "Subtidal", "Intertidal", "River"))
+plate_metrics_by_substrate$salinity <- factor(plate_metrics_by_substrate$salinity, levels=c("Marine", "Brackish", "Fresh"))
+
+sub_usage <- plate_metrics_by_substrate %>% 
+  group_by(transect, salinity, substrate, type) %>% 
+  summarise(used = sum(sub_used==T)) %>% 
+  mutate(type = ifelse(type == "Phenolic Compound", "Phenol", type),
+         type = paste(type, "s", sep=""))
+
+sub_usage$salinity <- factor(sub_usage$salinity, levels = rev(c("Marine", "Brackish", "Fresh")))
+
+heatmap_substrates <- sub_usage %>% ggplot(aes(substrate, transect, fill=factor(used))) +
+  geom_tile(color = "grey60", #linetype = "dashed", 
+            size = 0.25) +
+  facet_grid2(salinity~type, scales = "free", space="free", switch="y", 
+             strip=strip_themed(background_y = list(element_rect(fill="#CEB7A7"), 
+                                              element_rect(fill="#C1D5CA"),
+                                              element_rect(fill="#C2FFF9")),
+                                background_x = element_rect(fill=NA, colour = NA),
+                                text_x = element_text(face="bold", size=10))) + 
+  #scale_fill_grey(start = 1, end = 0.2) +
+  scale_fill_manual(values = c("white", "#b3cde3", "#8c96c6", "#8856a7", "#4b0082"))+
+#scale_fill_stepsn(colors=c("#fc8961", "#b73779", "#51127c", "#000004"), breaks=c(0,1,2,3,4))+
+  theme_bw() + 
+  #geom_tile(data = sub_usage[sub_usage$used==0,], fill="white", color = "#6A6A6A", linetype = "dashed", size = 0.25) +
+  theme(axis.text.x = element_text(angle=45, hjust = 1, vjust=1),
+        strip.placement = "outside") +
+  labs(x="Substrate", y="", fill="Months\nused")
+
+heatmap_substrates
+
+tiff(filename="~/Desktop/Desktop/Norway/Research/Writing/Trying to publish/Figures/Figure_8.tiff", units="mm", width=336, height=120, res=400)
+heatmap_substrates
+dev.off()
+```
+
+## Heatmap with May for SI (S12)
+```{r}
+plate_metrics_by_well <- read_csv("Plate Data/plate_metrics_by_well.csv")
+plate_metrics_by_well$transect <- factor(plate_metrics_by_well$transect, levels=c("Fjord", "Subtidal", "Intertidal", "River"))
+plate_metrics_by_well$salinity <- factor(plate_metrics_by_well$salinity, levels=c("Marine", "Brackish", "Fresh"))
+
+plate_metrics_by_substrate <- read_csv("Plate Data/plate_metrics_by_substrate.csv")
+plate_metrics_by_substrate$transect <- factor(plate_metrics_by_substrate$transect, levels=c("Fjord", "Subtidal", "Intertidal", "River"))
+plate_metrics_by_substrate$salinity <- factor(plate_metrics_by_substrate$salinity, levels=c("Marine", "Brackish", "Fresh"))
+
+plate_metrics_by_substrate_may <- read_csv("~/Desktop/Desktop/Norway/Research/Thesis_Data/Plate Data/plate_metrics_by_substrate_may.csv") %>% filter(transect == "A2") %>% 
+  mutate(salinity = "Marine",
+         transect = "Fjord (May)")
+
+
+autc_heat <- plate_metrics_by_well %>% 
+  filter(substrate != "Water") %>% 
+  group_by(name, substrate) %>%
+  mutate(autc = ifelse(is.purp.odi == T, autc, NA)) %>% 
+  summarise(mean_autc = mean(autc, na.rm = T)) %>% 
+  full_join(plate_metrics_by_substrate) %>% 
+  mutate(mean_autc = ifelse(sub_used == T, mean_autc, 0)) %>% 
+  ungroup() %>% 
+  select(2:6,8) %>% 
+  full_join(plate_metrics_by_substrate_may[,c(2,5,6,11,12)]) %>% 
+  group_by(salinity, transect, substrate, type) %>% 
+  summarise(median_autc = median(mean_autc, na.rm = T)) %>% 
+  mutate(transect=factor(transect, levels=c("Fjord (May)", "Fjord", "Subtidal", "Intertidal", "River"), 
+                         labels=c("Fjord (May)","Fjord", "Subtidal", "Intertidal", "River")), 
+         salinity=factor(salinity, levels=c("Marine", "Brackish", "Fresh")),
+         type = ifelse(type == "Phenolic Compound", "Phenol", type))
+
+autc_heat %>% ggplot(aes(transect, substrate, fill=median_autc)) +
+  geom_tile(color = "#6A6A6A", linetype = "dashed", size = 0.25) +
+  scale_fill_viridis_c(option = "magma", direction = -1) +
+  geom_tile(data = autc_heat[autc_heat$median_autc==0,], aes(transect, substrate), fill="white", color = "#6A6A6A", linetype = "dashed", size = 0.25) +
+  theme_cowplot() +
+  facet_grid2(type~salinity, scales = "free", space = "free", 
+             switch = "y",
+             strip=strip_themed(background_x = list(element_rect(fill="#C2FFF9"), 
+                                              element_rect(fill="#C1D5CA"),
+                                              element_rect(fill="#CEB7A7")))) +
+  theme(strip.placement = "outside", 
+        strip.background.y = element_blank(),
+        axis.title.y = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.border = element_rect(color="black"), 
+        axis.text.x = element_text(size=10,angle = 45, vjust = 1, hjust=1),
+        text = element_text(size=12),
+        axis.text.y = element_text(size=10)) +
+  labs(fill= "Median \nAUTC", x="")
+```
+
+## PCA with plates
+```{r}
+autc_mean_wide <- plate_metrics_by_well %>% filter(substrate != "Water") %>% 
+  group_by(name, substrate) %>%
+  mutate(autc = ifelse(is.purp.odi == T, autc, NA)) %>% 
+  summarise(mean_autc = mean(autc, na.rm = T)) %>% 
+  full_join(plate_metrics_by_substrate) %>% 
+  mutate(mean_autc = ifelse(sub_used == T, mean_autc, 0)) %>% 
+  select(name, substrate, mean_autc) %>% 
+  pivot_wider(names_from = "substrate", values_from = "mean_autc") %>% 
+  column_to_rownames(var="name") %>% t()
+
+autc_mean_metadata <- plate_metrics_by_well %>% filter(substrate != "Water") %>%
+  unite("saltrans", salinity:transect, remove = F) %>% 
+  group_by(name, month, salinity, transect, saltrans, substrate) %>% 
+  summarise(mean_autc = mean(autc)) %>% 
+  pivot_wider(names_from = "substrate", values_from = "mean_autc") %>% 
+  column_to_rownames(var="name") %>% select(month, salinity, transect, saltrans)
+
+
+autc.mean.pca <- PCAtools::pca(autc_mean_wide, scale = FALSE, metadata = autc_mean_metadata) # Runs the PCA
+
+
+
+PCAtools::biplot(autc.mean.pca, lab = NULL, 
+       colby = "salinity", shape ="transect", 
+       colkey = c("Fresh" = "#703205", "Brackish" = "#95BBA6", "Marine" = "#00CCB8"), 
+       ellipse = T, ellipseType="t", ellipseLevel = 0.95, ellipseAlpha = 0.2, ellipseLineSize = 0 , 
+       showLoadings = T, legendPosition = "right",
+       ylim=c(-25,12), xlim = c(-25,35),
+       xlab = "PC1 (64%)", ylab="PC2 (10%)") + 
+  coord_fixed() + 
+  labs(shape="Station", color="Suspension \nSalinity") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        text = element_text(size=30)) +
+  geom_hline(yintercept =0, linetype=3, col="black", alpha=0.3) + 
+  geom_vline(xintercept =0, linetype=3, col="black", alpha=0.3) 
+
+
+autc.mean.pca.veg <- rda(t(autc_mean_wide), scale = FALSE)
+
+scores.PCA.plate <- scores(autc.mean.pca.veg, display=c("sites","sp"), scaling = "symmetric") # sites, species
+
+plate.PCA.sites <- data.frame(scores.PCA.plate$sites)
+plate.PCA.arrows <- data.frame(scores.PCA.plate$species)
+plot.plate.PCA.arrows <- plate.PCA.arrows %>% mutate(arrow.length = sqrt(PC1^2+PC2^2)) %>% arrange(desc(arrow.length)) %>% slice(1:10) %>% 
+  mutate(labelx=c(4.8, 3.5, 2.3, 0.7, 2.8, -.5, 3.7, 3.7, 1.5, 2.8), 
+         labely=c(1.5, 0.1, 1.3, -2.8, -1.3, -2.5, 0.5, 0.9, -2.1, -0.3))
+
+
+summary(autc.mean.pca.veg) #PC1=63.9%, PC2=9.8%
+
+sal_cols_pca <- c("#00CCB8","#95BBA6","#703205")
+```
+
+
+```{r}
+plot.PCA.plate <- ggplot(plate.PCA.sites, aes(x = PC1, y = PC2)) +
+  geom_hline(yintercept=0, linetype="dotted") +
+  geom_vline(xintercept=0, linetype="dotted") +
+  stat_ellipse(geom="polygon",
+               aes(fill=factor(autc_mean_metadata$salinity)),
+               alpha=0.3)+
+  geom_point(aes(fill = factor(autc_mean_metadata$salinity),
+                 shape = factor(autc_mean_metadata$transect)),
+             size = 7, 
+             col="white") +
+  scale_fill_manual(values = sal_cols_pca) +
+  scale_shape_manual(values = c(21,24,22,23,25)) +
+  geom_segment(data = plot.plate.PCA.arrows,
+               aes(x = 0, xend = PC1, y = 0, yend = PC2), 
+               arrow=arrow(length=unit(0.01,"npc")),
+               color = "black") +
+  geom_label(data = plot.plate.PCA.arrows,
+            aes(x = labelx, y = labely, label=rownames(plot.plate.PCA.arrows)),
+            size = 4,
+            color = "black",
+            alpha = 0.5) +
+  labs(color = "Suspension\nSalinity", 
+       shape = "Station", fill = "Suspension\nSalinity",
+       x = "PC1 (63.9%)",
+       y = "PC2 (9.8%)",
+       size = 8) +
+  theme_linedraw() +
+  theme(panel.grid = element_blank(),
+        #text = element_text(size = 25),
+        legend.background = element_blank(),
+        legend.box.background= element_rect(colour="black"),
+        legend.position = "right", 
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=14)) +
+  guides(linetype = guide_legend(order = 3, keyheight = unit(0.5, "inch")),
+         shape=guide_legend(order=2, override.aes = list(col="black", size=5)), 
+         fill=guide_legend(order=1, override.aes = list(pch=21, size=5))) +
+  coord_fixed() +
+  xlim(-3,6)
+plot.PCA.plate
+```
+
+## Variance partitioning
+```{r}
+varp.plate <- varpart(t(autc_mean_wide), ~salinity, ~transect, data=autc_mean_metadata) 
+plot(varp.plate)
+
+
+rda.all <- rda(t(autc_mean_wide) ~transect + salinity, data=autc_mean_metadata)
+anova(rda.all) #p=0.001
+
+rda.sal <- rda(t(autc_mean_wide) ~salinity, data=autc_mean_metadata)
+anova(rda.sal) #p=0.001
+
+rda.trans <- rda(t(autc_mean_wide) ~transect, data=autc_mean_metadata)
+anova(rda.trans) #p=0.007
+
+rda.sal.trans <- rda(t(autc_mean_wide) ~ salinity + Condition(transect), data=autc_mean_metadata)
+anova(rda.sal.trans) #p=0.001
+
+rda.trans.sal <- rda(t(autc_mean_wide) ~ transect + Condition(salinity), data=autc_mean_metadata)
+anova(rda.sal.trans) #p=0.001
+
+```

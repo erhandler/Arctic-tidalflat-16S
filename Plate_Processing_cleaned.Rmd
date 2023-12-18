@@ -1,0 +1,392 @@
+---
+title: "Processing plate data to get 4 nice dataframes of metrics (by well, by substrate, by type, by plate)"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+#Load in the libraries we'll use
+```{r}
+library(tidyverse)
+library(fs)
+library(lubridate)
+library(cowplot)
+
+setwd("~/Desktop/Desktop/Norway/Research/Thesis_Data/Plate Data/")
+```
+
+
+# Processing all the data at once!
+## Load in the spectrums
+```{r}
+# Load the wavelength data
+data_dir <- "all_spectrum" # pick the folder to pull in files from
+specs <- data_dir %>% 
+  dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+  map_dfr(read.delim, skip=28, .id = "source", nrow=21) # create a dataframe with all the files by row binding, nrow=8 prevents getting the last line which we don't want
+
+# Get the dates from the top line ELLIE CHECK WHERE TEHSE ARE ACTUALLY COMING FROM IS THIS THE RIGHT DATE!
+dates <- data_dir %>% 
+  dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+  map_dfr(read.delim, skip=20, .id = "source", nrow=1, colClasses=c(rep("NULL",4),"character"), col.names=c("1", "2", "3", "4", "date"))  # create a dataframe with all the files by row binding
+
+# Get plate names from the file 
+names <- data_dir %>% 
+  dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+  map_dfr(read.delim, .id = "source", nrow=1, header = F, colClasses=c("character", rep("NULL",3)), col.names=c("name", "1", "2", "3")) %>% 
+  mutate(name = str_sub(name, 1, -11)) #have to increase to 11 because of the s marking spectrums...
+
+# Get wavelength measured
+# wvlngth <- data_dir %>%
+#   dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+#   map_dfr(read.delim, .id = "source", skip=10, nrow=1, header = F, colClasses=c(rep("NULL",4),"factor"), col.names=c("1", "2", "3", "4", "wave"))
+
+# Merge everything into one file using source as the key
+X1 <- full_join(specs, dates)
+spectrum <- full_join(X1, names) %>% 
+  pivot_longer(cols= -c(source, nm, date, name), names_to="well", values_to="abs") %>% 
+  separate(col= well, into = c("let","num"), sep = 1) %>% 
+  mutate(replicate = if_else(as.numeric(num) <5, 1, 2)) %>% 
+  mutate(replicate = as.factor(if_else(as.numeric(num) >8, 3, replicate))) %>% 
+  unite("well", let:num, sep = "")
+  
+```
+
+## Load in the multiples
+```{r}
+# Load the wavelength data (x3 to get the three wavelengths)
+data_dir <- "all_multiple" # pick the folder to pull in files from
+mult1 <- data_dir %>% 
+  dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+  map_dfr(read.delim, skip=27, .id = "source", nrow=8) %>% mutate(wavelength="Wavelength 1 (nm):") # create a dataframe with all the files by row binding, nrow=8 prevents getting the last line which we don't want
+mult2 <- data_dir %>% 
+  dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+  map_dfr(read.delim, skip=40, .id = "source", nrow=8) %>% mutate(wavelength="Wavelength 2 (nm):") # create a dataframe with all the files by row binding, nrow=8 prevents getting the last line which we don't want
+mult3 <- data_dir %>% 
+  dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+  map_dfr(read.delim, skip=52, .id = "source", nrow=8) %>% mutate(wavelength="Wavelength 3 (nm):") # create a dataframe with all the files by row binding, nrow=8 prevents getting the last line which we don't want
+
+
+# Get wavelength measured
+waves3 <- data_dir %>%
+   dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+   map_dfr(read.delim, .id = "source", skip=10, nrow=3, header = F, colClasses=c("NULL","character", "NULL", "NULL", "integer"), col.names=c("1", "wavelength", "3", "4", "nm"))
+
+# Get the date and time of start scanning
+dates <- data_dir %>% 
+  dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+  map_dfr(read.delim, skip=20, .id = "source", nrow=1, colClasses=c(rep("NULL",4),"character"), col.names=c("1", "2", "3", "4", "date"))  # create a dataframe with all the files by row binding
+
+# Get plate names from the file 
+names <- data_dir %>% 
+  dir_ls(regexp = "\\.TXT$") %>% # get a list of all the files with the right extension
+  map_dfr(read.delim, .id = "source", nrow=1, header = F, colClasses=c("character", rep("NULL",3)), col.names=c("name", "1", "2", "3")) %>% 
+  mutate(name = str_sub(name, 1, -11)) #have to increase to 11 because of the s marking spectrums...
+
+
+# Merge everything into one file using source as the key
+X1 <- full_join(mult1, mult2)
+X2 <- full_join(X1, mult3)
+X3 <- full_join(X2, dates)
+X4 <- full_join(X3, waves3) %>% select(-"wavelength")
+
+multiples <- full_join(X4, names) %>% 
+  pivot_longer(cols= -c(source, X, date, nm, name), names_to="num", values_to="abs") %>% 
+  mutate(num = as.numeric(str_sub(num, 2))) %>% 
+  mutate(replicate = if_else(num<5, 1, 2)) %>% 
+  mutate(replicate = as.factor(if_else(num>8, 3, replicate))) %>% 
+  relocate(X, .before = num) %>% 
+  unite("well", X:num, sep = "") 
+```
+
+
+## Joining into one massive dataframe with split out data
+```{r}
+all_data <- full_join(spectrum, multiples) %>% 
+mutate(date = dmy_hms(date)) %>% 
+  mutate(month = month(date)) %>% 
+  mutate(temp = if_else(grepl("4",name), "4", "10")) %>% 
+  mutate(transect = if_else(grepl("r",name), "River", "Fjord")) %>% 
+  mutate(transect = if_else(grepl("s",name), "Intertidal", transect)) %>%
+  mutate(transect = if_else(grepl("d",name), "Subtidal", transect)) %>% 
+  mutate(transect = if_else(grepl("a",name), "A2 Surface Water", transect)) %>% 
+  mutate(salinity = if_else(grepl("m", name), "Marine", "Fresh")) %>% 
+  mutate(salinity = if_else(grepl("b", name), "Brackish", salinity)) %>% 
+  mutate(salinity = if_else(grepl("a", name), "N/A", salinity))
+  
+all_data$transect <- factor(all_data$transect, levels=c("A2 Surface Water", "Fjord", "Subtidal", "Intertidal", "River"))
+
+all_data$salinity <- factor(all_data$salinity, levels=c("Marine", "Brackish", "Fresh"))
+
+# Read in substrate information (substrate and type)
+subs <- read.csv("~/Desktop/Desktop/Norway/Research/Thesis_Data/Plate Data/CarbonSubstrates.csv") 
+
+# Level substrates by how they appear on the plates (A1, B1, C1, D1, E1, F1, G1, H1, A2, B2... )
+subs$substrate <- factor(subs$substrate, levels=c("Water", "Pyruvic Acid Methyl Ester", "Tween 40", "Tween 80", "α-Cyclodextrin", "Glycogen", "D-Cellobiose", "α-D-Lactose", "β-Methyl-D-Glucoside", "D-Xylose", "i-Erythritol", "D-Mannitol", "N-Acetyl-D-Glucosamine", "D-Glucosaminic Acid", "Glucose-1-Phosphate", "D,L-α-Glycerol-Phosphate", "D-Galactonic Acid γ-Lactone", "D-Galacturonic Acid", "2-Hydroxy-Benzoic Acid", "4-Hydroxy-Benzoic Acid", "γ-Hydroxy-Butyric Acid", "Itaconic Acid", "α-Keto-Butyric Acid", "D-Malic Acid", "L-Arginine", "L-Asparagine", "L-Phenylalanine", "L-Serine", "L-Threonine", "Glycyl-L-Glutamic Acid", "Phenylethylamine", "Putrescine"))
+
+all_data <- full_join(all_data,subs)
+```
+
+
+## Getting the blank adjusted spectrums
+```{r}
+# Get mean absorbance and mean T0 adjusted absorbance for each substrate (i.e. mean and SD of the three replicate wells)
+mean_spec <- all_data %>% 
+  group_by(source, name, date, month, nm, substrate, type, temp, transect, salinity) %>%
+  summarize(mean_abs = mean(abs), 
+            sd_abs = sd(abs))
+
+
+# Get mean absorbance  for just the blank wells
+mean_water_spec <- all_data %>% 
+  filter(substrate == "Water") %>% 
+  group_by(source, name, date, nm) %>% 
+  summarize(water_abs = mean(abs)) %>% 
+  ungroup()
+
+# Join in the mean blank values to the mean absorbance dataframe and subtract to get adjusted mean values
+mean_spec <- full_join(mean_spec, mean_water_spec, by=c("source", "date", "nm", "name")) %>%
+  mutate(adj_mean_abs = mean_abs - water_abs) 
+
+# Join in the mean blank values to the full dataframe and subtract to get adjusted individual wells
+adjusted_specs <- full_join(all_data, mean_water_spec, 
+                            by=c("source", "date", "nm", "name")) %>% 
+  mutate(adj_abs = abs-water_abs)
+
+# This is silly but it basically just renames adjusted_specs to all_data because that's what I had called it before :) 
+all_data <- full_join(all_data, adjusted_specs)
+```
+
+
+## Subtract T0 from all wells
+```{r}
+# Find the row with T0 (plates were all measured shortly after sediments added) and rename date and abs appropriately
+first_time <- all_data %>% group_by(name,well,nm) %>% 
+  slice(which.min(date)) %>% 
+  rename(first_abs_adj = adj_abs, 
+         time0 = date) %>% 
+  ungroup() %>% 
+  select(c(nm, name, well, first_abs_adj, time0))
+
+# Join the first time with the data and subtract T0 abs from all wells, if a well is negative set it to 0
+all_data <- full_join(all_data, first_time) %>% 
+  mutate(incub_time_sec = date - time0, 
+         incub_time_day = as.numeric(difftime(date, time0), units="days"),
+         ODi = adj_abs - first_abs_adj, 
+         ODi = ifelse(ODi>0, ODi, 0),
+         ODi = round(ODi, 3))
+```
+
+
+
+
+## Filter to just get 590nm 
+```{r}
+# Make a new dataframe with only absorbances at 590 nm! This is what we will work with
+only_590 <- all_data %>% filter(nm ==590)
+
+write_csv(only_590, "Plate_absorbances_590nm.csv") # save it
+
+mean_590 <- mean_spec %>% filter(nm ==590)
+
+final_590 <- only_590 %>%  filter(incub_time_day>13.5, incub_time_day<14.2)
+```
+
+## Filter 590nm to just get 10ºC because we don't trust most of the 4º...
+```{r}
+only_10_590 <- only_590 %>% filter(temp == 10)
+mean_10_590 <- mean_590 %>% filter(temp == 10)
+```
+
+# Now get the metrics to actually help us understand! I will only work with the 10º plates
+
+## 1) Is the well purple? 
+I will use ODi > 0.25 to determine if each well is purple. 
+```{r}
+only_10_590 <- only_10_590 %>% 
+  group_by(name, month, salinity, substrate, type, incub_time_day) %>% 
+  mutate(is.purp.odi = ifelse(ODi > 0.25, T, F)) %>% 
+  ungroup()
+```
+
+### Can the community use the substrate? If at least 2 wells are purple, substrate is used
+```{r}
+purple_odi_substrates <- only_10_590 %>% 
+  group_by(month, transect, salinity, incub_time_day, name, substrate, type) %>% 
+  summarize(num_purp_sub_25 = sum(is.purp.odi ==T)) %>% 
+  mutate(sub_used = ifelse(num_purp_sub_25 >1, T, F))
+```
+
+### How many substrates are used on each plate? 
+```{r}
+substrate_richness <- purple_odi_substrates %>% group_by(month, transect, salinity, incub_time_day, name) %>% 
+  summarise(sub_rich = sum(sub_used == T))
+```
+
+### How many of each type of substrate are used on each plate? 
+```{r}
+substrate_richness_by_type <- purple_odi_substrates %>%
+  group_by(month, transect, salinity, incub_time_day, name, type) %>% 
+  summarise(sub_rich_type = sum(sub_used == T), 
+            n=n()) %>% drop_na(type) %>% 
+  mutate(percent_used_type = sub_rich_type/n)
+```
+
+
+## 2) Steepest slope (calcuated using ODi, both for each well and means for substrates)
+```{r}
+# Calculate slope between each measured point by subtracting ODi and dividing by time
+slopes <- only_10_590 %>% filter(incub_time_day<14.2) %>% 
+  arrange(incub_time_sec) %>% 
+  group_by(name, well) %>% 
+  mutate(slopess = ((ODi - lag(ODi)) / (incub_time_day - lag(incub_time_day))))%>%
+  ungroup()
+
+# Find maximums by slicing at max and then rename columns and get rid of unnecessary information. Time of maximum slope is now the final point of the maximum -- i.e. if the maximum slope occurred between day 7 and 8, the time of max slope is recorded as 8. 
+max_slopes <- slopes %>% filter(incub_time_day>3) %>% 
+  group_by(name, well) %>%
+  slice_max(slopess) %>% 
+  ungroup() %>% 
+  rename(max_slope = slopess, 
+         max_slope_time_day = incub_time_day) %>% 
+  select(month, salinity, transect, name, well, max_slope, max_slope_time_day)
+
+
+# Add in information from final reading -- what really matters here is if the wells are purple. Then set non-purple wells to NA for max slope
+max_slopes <- only_10_590 %>% filter(incub_time_day>13.5, incub_time_day<14.2) %>% select(-c(date, incub_time_day, source, nm)) %>% full_join(max_slopes) %>% 
+  mutate(max_slope = ifelse(is.purp.odi == T, max_slope, NA), 
+         max_slope_time_day = ifelse(is.purp.odi == T, max_slope_time_day, NA))
+
+# Calculate mean maximum slopes and mean times of max slope for substrates
+max_mean_slopes <- max_slopes %>% group_by(month, salinity, transect, name, substrate) %>% summarise(mean_max_slopes = mean(max_slope, na.rm=T), mean_day_max = mean(max_slope_time_day, na.rm=T))
+
+# Exclude non-purple wells!
+max_mean_slopes <-  purple_odi_substrates %>% 
+  filter(incub_time_day>13.5, incub_time_day<14.2) %>%
+  select(-c(incub_time_day)) %>% 
+  full_join(max_mean_slopes) %>% 
+  mutate(mean_max_slopes = ifelse(sub_used == T, mean_max_slopes, NA),
+         mean_day_max = ifelse(sub_used == T, mean_day_max, NA))
+```
+
+
+
+## 3) Time since T0 when the steepest increase occured
+This is now in `max_slopes` or `max_mean_slopes` for wells or for substrates.
+
+
+## 4) Absorbance at the end (T0 and blank adjusted)
+```{r}
+final_10_590 <- only_10_590 %>% filter(incub_time_day>13.5, incub_time_day<14.2)
+```
+
+
+## 5) AWCD (for each plate through time)
+```{r}
+awcd_byrep <- only_10_590 %>% filter(substrate != "Water") %>% 
+  group_by(name,month, transect, salinity, incub_time_day, replicate) %>% 
+  summarise(awcd_byrep = mean(ODi))
+
+awcd <- awcd_byrep %>% 
+  group_by(name,month, transect, salinity, incub_time_day) %>% 
+  summarise(awcd = mean(awcd_byrep), 
+            sd_awcd = sd(awcd_byrep))
+```
+
+## 6) SAWCD (for each plate through time)
+```{r}
+sawcd <- only_10_590 %>% filter(substrate != "Water") %>% 
+  group_by(name,month, transect, salinity, type, incub_time_day, replicate) %>% 
+  summarise(sawcd_byrep = mean(ODi)) %>% 
+  group_by(name,month, transect, salinity, type, incub_time_day) %>% 
+  summarise(sawcd = mean(sawcd_byrep), 
+            sd_sawcd = sd(sawcd_byrep))
+```
+
+## 7) DIVERSITY INDICES?!?!?! -- all equations from Németh et al. (they cite other things!)
+
+### Shannon Index (H)
+```{r}
+# Need to calculate Pi, which is: ODi of the well / sum(ODi of the plate)
+
+# First need sums of ODi for each plate, at each time
+by_plate <- only_10_590 %>% filter(substrate!="Water") %>% 
+  group_by(name, incub_time_day) %>% 
+  summarise(total_ODi = sum(ODi)) 
+
+# Now join this back to full data frame to divide individual wells by the sum, then group by plate and time again and calculate shannon! 
+shannon <- only_10_590 %>% filter(substrate!="Water") %>% 
+  group_by(name, incub_time_day, month, transect, salinity) %>% 
+  full_join(by_plate) %>% 
+  mutate(Pi = ODi/total_ODi) %>% 
+  group_by(name, incub_time_day, month, transect, salinity) %>% 
+  summarise(H = -sum(Pi * log(Pi), na.rm = T))
+```
+
+
+### Simpson's Index (D)
+
+```{r}
+simpson <- only_10_590 %>% filter(substrate!="Water") %>% 
+  group_by(name, incub_time_day, month, transect, salinity) %>% 
+  full_join(by_plate) %>% 
+  mutate(Pi = ODi/total_ODi) %>% 
+  group_by(name, incub_time_day, month, transect, salinity) %>% 
+  summarise(D = -log(sum(Pi^2)))
+```
+
+### Shannon's Evenness (E)
+```{r}
+shannoneven <- full_join(shannon, substrate_richness) %>% 
+  mutate(E = H/log(sub_rich))
+```
+
+
+## 8) Area under the curve
+```{r}
+autc_well <- only_10_590 %>% filter(incub_time_day<14.2) %>% 
+  arrange(incub_time_sec) %>% 
+  group_by(name, well) %>% 
+  mutate(autc_pertime = ((ODi + lag(ODi))/2 * (incub_time_day - lag(incub_time_day))))%>%
+  group_by(month, transect, salinity, name, well, substrate, type) %>% drop_na(autc_pertime) %>% 
+  summarise(autc = sum(autc_pertime))
+
+
+autc <- autc_well %>% full_join(final_10_590) %>%  filter(substrate != "Water") %>% 
+  group_by(name, substrate) %>%
+  mutate(autc = ifelse(is.purp.odi == T, autc, NA)) %>% 
+  summarise(mean_autc = mean(autc, na.rm = T)) %>% 
+  full_join(purple_odi_substrates[purple_odi_substrates$incub_time_day>13.5 & purple_odi_substrates$incub_time_day<14.2,]) %>% 
+  mutate(mean_autc = ifelse(sub_used == T, mean_autc, 0))
+```
+
+
+
+# Combining metrics! (for the end if over time!) into one sheet that I save as a csv 
+```{r}
+# by well includes: adjusted abs for each well at the end, is the well purple?, autc by well
+plate_metrics_by_well <- only_10_590 %>% 
+  filter(incub_time_day>13.5, incub_time_day<14.2) %>% full_join(autc_well)
+
+write_csv(plate_metrics_by_well, "plate_metrics_by_well.csv")
+
+# by substrate includes: is the substrate purple, max slope, and time of max slope, mean autc for substrates
+plate_metrics_by_substrate <- purple_odi_substrates %>% filter(incub_time_day>13.5, incub_time_day<14.2) %>% full_join(max_mean_slopes) %>% full_join(autc) %>% drop_na(type)
+  
+write_csv(plate_metrics_by_substrate, "plate_metrics_by_substrate.csv")
+
+# by type includes: % of substrates within each type positive at the end, SAWCD
+plate_metrics_by_type <- full_join(sawcd, substrate_richness_by_type) %>% 
+  filter(incub_time_day>13.5, incub_time_day<14.2) %>% 
+  drop_na(type)
+
+write_csv(plate_metrics_by_type, "plate_metrics_by_type.csv")
+
+# by plate includes: AWCD, diversity indices (Shannon, Simpson, Evenness, Substrate Richness)
+plate_metrics_by_plate <- full_join(awcd, shannoneven) %>% full_join(simpson) %>% full_join(substrate_richness) %>% 
+  filter(incub_time_day>13.5, incub_time_day<14.2)
+
+write_csv(plate_metrics_by_plate, "plate_metrics_by_plate.csv")
+```
+
+

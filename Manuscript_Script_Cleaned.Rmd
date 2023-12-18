@@ -1,0 +1,692 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+This file will contain processing of all data... at least that is the goal! 
+
+
+# Load Libraries
+Here, the special packages will so far only be what we need for processing the sequences
+```{r}
+library(tidyverse)
+library(phyloseq)
+library(dada2)
+library(Biostrings)
+library(ShortRead)
+library(decontam)
+library(microbiome)
+library(vegan)
+```
+
+# Process sequences to get ASV table
+### Initial directory setting
+```{r}
+# Set working directory
+setwd("~/Desktop/Desktop/Norway/Research/Thesis_Data/DNA")
+
+# Directory containing the fastq files: 
+path <- "~/Desktop/Desktop/Norway/Research/Thesis_Data/DNA/VaderV3V4"  
+list.files(path)
+
+# Get paths for the forward and reverse files
+fnFs <- sort(list.files(path, pattern = "R1_001.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "R2_001.fastq.gz", full.names = TRUE))
+```
+
+### Remove primers from sequences using Cutadapt
+```{r}
+## Forward and reverse primer sequences for 341F and 805R (Illumina/Klindworth 2013) 
+FWD <- "CCTACGGGNGGCWGCAG"  
+REV <- "GACTACHVGGGTATCTAATCC"
+
+# First we'll check for primers in the sequences
+
+# Create all orientations of the input primer sequences
+allOrients <- function(primer) {
+  require(Biostrings)
+  dna <- DNAString(primer)  # Biostrings works w/ DNAString objects rather than character vectors
+  orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+               RevComp = reverseComplement(dna))
+  return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+
+# Filter sequences to remove ambiguous Ns before mapping primers
+# - Put N-filterd files in filtN/ subdirectory
+fnFs.filtN <- file.path(path, "filtN", basename(fnFs)) 
+fnRs.filtN <- file.path(path, "filtN", basename(fnRs))
+bloop <- filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE, truncQ = 0)
+bloop
+
+primerHits <- function(primer, fn) {
+  # Counts number of reads in which the primer is found
+  nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+  return(sum(nhits > 0))
+}
+
+#where do we find the primers?! Just looking at the first sample here
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]), 
+      FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[1]]), 
+      REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[1]]), 
+      REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+
+# looks as we would expect! hurray!
+
+cutadapt <- "/Users/elliehandler/miniconda3/envs/cutadaptenv/bin/cutadapt" # CHANGE ME to the cutadapt path on your machine
+system2(cutadapt, args = "--version") # Run shell commands from R
+
+path.cut <- file.path(path, "cutadapt2") # USING 2 HERE BECAUSE FIRST I KEPT THE SEQUENCES WITHOUT PRIMERS
+if(!dir.exists(path.cut)) dir.create(path.cut)
+fnFs.cut <- file.path(path.cut, basename(fnFs))
+fnRs.cut <- file.path(path.cut, basename(fnRs))
+
+FWD.RC <- dada2:::rc(FWD)
+REV.RC <- dada2:::rc(REV)
+# Trim FWD and the reverse-complement of REV off of R1 (forward reads)
+R1.flags <- paste("-g", FWD, "-a", REV.RC) 
+# Trim REV and the reverse-complement of FWD off of R2 (reverse reads)
+R2.flags <- paste("-G", REV, "-A", FWD.RC) 
+
+# Run Cutadapt -- discarding sequences without primers :)
+for(i in seq_along(fnFs)) {
+  system2(cutadapt, args = c(R1.flags, R2.flags, "--discard-untrimmed", "-n", 2, # -n 2 required to remove FWD and REV from reads
+                             "-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+                             fnFs.filtN[i], fnRs.filtN[i])) # input files
+}
+
+# Are there primers left?
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), 
+      FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.cut[[1]]), 
+      REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.cut[[1]]), 
+      REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+# nope! a success!!!
+
+# Forward and reverse fastq filenames have the format:
+cutFs <- sort(list.files(path.cut, pattern = "1_001.fastq.gz", full.names = TRUE))
+cutRs <- sort(list.files(path.cut, pattern = "2_001.fastq.gz", full.names = TRUE))
+
+# Extract sample names, assuming filenames have format:
+get.sample.name <- function(fname) strsplit(basename(fname), "_")[[1]][1]
+sample.names <- unname(sapply(cutFs, get.sample.name))
+head(sample.names)
+```
+
+### Continue processing with DADA2
+```{r}
+filtFs <- file.path(path.cut, "filtered", basename(cutFs))
+filtRs <- file.path(path.cut, "filtered", basename(cutRs))
+
+# Filter with DADA2 method -- truncate forward and reverse with a quality filter (maxEE)
+# Need to do this or they don't merge nicely...
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs, maxN = 0, maxEE = c(2, 5), 
+                     truncQ = 2, truncLen = c(253,189), rm.phix = TRUE, 
+                     compress = TRUE, multithread = TRUE)
+out # out now has reads.in (only sequences that had primers!) and reads.out (left after filterandtrim!)
+
+# Learn error rates for forward and reverse reads, default uses 10^8 bps
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+
+plotErrors(errF, nominalQ = TRUE)
+
+# Dereplicate forward and reverse reads
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# Infer composition of samples using the pseudo-pool option to decrease effects of different numbers of sequences/sample
+dadaFs_pseudo_pool <- dada(derepFs, err = errF, multithread = TRUE, pool = "pseudo")
+dadaRs_pseudo_pool <- dada(derepRs, err = errR, multithread = TRUE, pool = "pseudo")
+
+# Merge pairs with minimum overlap of 12 bp and no mismatches 
+mergers_pseudo_pool <- mergePairs(dadaFs_pseudo_pool, derepFs, dadaRs_pseudo_pool, derepRs, verbose=TRUE)
+
+# Make ASV table
+seqtab_pseudo_pool <- makeSequenceTable(mergers_pseudo_pool)
+dim(seqtab_pseudo_pool)
+
+# Remove chimeras
+seqtab.nochim_pseudo_pool <- removeBimeraDenovo(seqtab_pseudo_pool, method="consensus", multithread=TRUE, verbose=TRUE)
+
+table(nchar(getSequences(seqtab.nochim_pseudo_pool)))
+
+# Make table with # of reads at each stage of processing
+getN <- function(x) sum(getUniques(x))
+track_pseudo_pool <- cbind(bloop, out, sapply(dadaFs_pseudo_pool, getN), sapply(dadaRs_pseudo_pool, getN), sapply(mergers_pseudo_pool, 
+                                                                       getN), rowSums(seqtab.nochim_pseudo_pool))
+colnames(track_pseudo_pool) <- c("input", "Ns removed", "primers clipped (removed w/out primers)", "quality filtered and truncated", "denoisedF", "denoisedR", "merged", 
+                     "nonchim")
+rownames(track_pseudo_pool) <- sample.names
+
+
+
+#### Transforming and saving the OTU sequences
+
+seqtab.nochim_trans_pseudo_pool <- as.data.frame(t(seqtab.nochim_pseudo_pool)) %>% 
+  rownames_to_column(var = "sequence") %>%
+  rowid_to_column(var = "OTUNumber") %>% 
+  mutate(OTUNumber = sprintf("OTU_%05d", OTUNumber)) %>% 
+  mutate(sequence = str_replace_all(sequence, "(-|\\.)", ""))
+
+#### Extract the sequences and export them in a fasta file:
+df <- seqtab.nochim_trans_pseudo_pool
+seq_out_pseudo_pool <- Biostrings::DNAStringSet(df$sequence)
+names(seq_out_pseudo_pool) <- df$OTUNumber
+seq_out_pseudo_pool
+
+dada2_dir <- "dada2_results/"
+
+Biostrings::writeXStringSet(seq_out_pseudo_pool, str_c(dada2_dir, "ASV_no_taxonomy_pseudo_pool.fasta"),
+                            compress = FALSE, width = 20000)
+# Save ASV table 
+write_csv(as.data.frame(seqtab.nochim_pseudo_pool), "seqtab_nochim_pseudo_pool.csv")
+```
+
+
+### Assign taxonomy with Silva v138.1
+```{r}
+# Using Silva database to assign taxonomy! 
+
+database_dir <- "databases/"  # folder with the Silva database with species
+
+w_spc_file <- paste0(database_dir, "silva_nr99_v138.1_wSpecies_train_set.fa.gz")
+# OBS! The next step takes a long time. ~2hrs on a medium fast computer...
+
+save.image("name.file.2.RData")
+
+taxa_wspc_pseudo_pool <- assignTaxonomy(seqtab.nochim_pseudo_pool, refFasta = w_spc_file,
+                       minBoot = 70, outputBootstraps = TRUE, verbose = TRUE, multithread = TRUE)
+
+# Save progress: 
+saveRDS(taxa_wspc_pseudo_pool, str_c(dada2_dir, "dada2.taxa_pseudo_pool.rds"))
+
+write_tsv(as_tibble(taxa_wspc_pseudo_pool$tax), file = str_c(dada2_dir, "taxa_wspc2_pseudo_pool.txt"))
+```
+
+
+#### Tax4Fun needs a different version, so using Silva v123 here
+```{r}
+silva_123_file <- paste0(database_dir, "silva_nr_v123_train_set.fa.gz") # doesn't have species 
+
+taxa_for_tax4fun <- assignTaxonomy(seqtab.nochim_pseudo_pool, refFasta = silva_123_file,
+                                   minBoot = 70, outputBootstraps = TRUE, verbose = TRUE, multithread = TRUE)
+
+silva_species_123 <- paste0(database_dir, "silva_species_assignment_v123.fa.gz") # add on species
+
+taxa_tax4fun_wspc <- addSpecies(taxa_for_tax4fun[["tax"]], refFasta =  silva_species_123)
+```
+
+
+### Append taxonomy and boot to the sequence table 
+```{r}
+taxa_wspc_tax_pseudo_pool <- as.data.frame(taxa_wspc_pseudo_pool$tax)
+taxa_wspc_boot_pseudo_pool <- as.data.frame(taxa_wspc_pseudo_pool$boot) %>% rename_all(funs(str_c(., "_boot")))
+
+seqtab.nochim_trans_wspc_pseudo_pool <- taxa_wspc_tax_pseudo_pool %>% bind_cols(taxa_wspc_boot_pseudo_pool) %>% bind_cols(seqtab.nochim_trans_pseudo_pool)
+
+#Check at the Kingdom-level for uniques
+unique(seqtab.nochim_trans_wspc_pseudo_pool$Kingdom)
+unique(seqtab.nochim_trans_wspc_pseudo_pool$Phylum)
+
+#Check for number of unidentified by phylum
+seqtab.nochim_trans_wspc_pseudo_pool %>% filter(is.na(Phylum)) %>% dplyr::summarise(across(c(17:76), sum)) %>% t()
+# not so many, we're happy with the classification! 
+```
+
+### Filter sequences
+```{r}
+# Check for Eukaryotes... 
+seqtab.nochim_trans_wspc_pseudo_pool[which(seqtab.nochim_trans_wspc_pseudo_pool$Kingdom=="Eukaryote"),] 
+# None actually! So can just proceed
+
+# Save as tsv
+write_tsv(seqtab.nochim_trans_wspc_pseudo_pool, str_c(dada2_dir, "OTU_table_wspc_pseudo_pool.tsv"))
+
+# Remove chloroplast and mitochondrial sequences
+rownames(seqtab.nochim_trans_wspc_pseudo_pool)<-seqtab.nochim_trans_wspc_pseudo_pool$OTUNumber
+
+not_chloro_mito_wspc_pseudo_pool <- seqtab.nochim_trans_wspc_pseudo_pool %>% filter(is.na(Order) | Order != "Chloroplast", is.na(Family) | Family != "Mitochondria") 
+```
+
+### Make phyloseq object
+```{r}
+OTU <- not_chloro_mito_wspc_pseudo_pool %>% select_if(is.numeric) %>%
+  select(-contains("_boot")) %>% as.matrix() %>% otu_table(taxa_are_rows = TRUE)
+
+TAX <- not_chloro_mito_wspc_pseudo_pool %>% select(Kingdom:Species) %>%
+  as.matrix() %>% tax_table()
+
+
+regexp <- "[[:digit:]]+"
+
+# Metadata / sample info
+sampledata <- data.frame(month = ifelse(grepl("Blank", sample_names(OTU)), NA, str_extract(sample_names(OTU), regexp)),
+                                     station = ifelse(grepl("Blank", sample_names(OTU)), NA, substr(sample_names(OTU), 3, 7)),
+                                     Sample_or_Control = ifelse(grepl("Blank", sample_names(OTU)), "Control Sample", "True Sample"),
+                                     row.names = sample_names(OTU),
+                                     stringsAsFactors=FALSE) %>% 
+  mutate(Transect = factor(station, levels = c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River"))) %>% 
+  sample_data()
+
+# join all three to make the phyloseq object
+ps_dada2_not_chloro_mito_wspc_pseudo_pool <- phyloseq(OTU, TAX, sampledata)
+
+
+saveRDS(ps_dada2_not_chloro_mito_wspc_pseudo_pool, str_c(dada2_dir, "phyloseq_pseudo_pool.rds"))
+
+ps_dada2_not_chloro_mito_wspc_pseudo_pool <- read_rds("/Users/elliehandler/Desktop/Desktop/Norway/Research/Thesis_Data/DNA/dada2_results/phyloseq_pseudo_pool.rds")
+```
+
+### Remove contaminants with decontam
+```{r}
+# ID contaminants by prevalance using extraction blanks that were also sequenced
+sample_data(ps_dada2_not_chloro_mito_wspc_pseudo_pool)$is.neg <- 
+  sample_data(ps_dada2_not_chloro_mito_wspc_pseudo_pool)$Sample_or_Control == "Control Sample"
+contamdf.prev <- isContaminant(ps_dada2_not_chloro_mito_wspc_pseudo_pool,
+                               method="prevalence", neg="is.neg", threshold = 0.5)
+table(contamdf.prev$contaminant)
+
+contamdf.prev %>% filter(contaminant == T) 
+# OTU_04506 is the contaminant!
+not_chloro_mito_wspc_pseudo_pool %>% filter(OTUNumber == "OTU_04506") 
+# Seems like it's likely a skin bacteria... makes sense that would be contamination
+
+# Remove the contaminant from the phyloseq file
+badTaxa = c("OTU_04506")
+goodTaxa <- setdiff(taxa_names(ps_dada2_not_chloro_mito_wspc_pseudo_pool), badTaxa)
+ps_dada2_not_chloro_mito_decontam_wspc_pseudo_pool <- prune_taxa(goodTaxa, ps_dada2_not_chloro_mito_wspc_pseudo_pool)
+
+# Now we can get rid of the blanks! they will serve no more purpose
+ps_dada2_not_chloro_mito_decontam_blanks_wspc_pseudo_pool <- subset_samples(ps_dada2_not_chloro_mito_decontam_wspc_pseudo_pool, Sample_or_Control == "True Sample")
+```
+
+### Remove singletons - keep only OTUs with more than one sequence in more than two samples
+```{r}
+wh0 <- genefilter_sample(ps_dada2_not_chloro_mito_decontam_blanks_wspc_pseudo_pool, filterfun_sample(function(x) x > 1),
+                         A=2)
+
+ps_dada2_not_chloro_mito_decontam_blanks_singletons_wspc_pseudo_pool <- prune_taxa(wh0, ps_dada2_not_chloro_mito_decontam_blanks_wspc_pseudo_pool)
+```
+
+### Remove samples with < 2000 reads
+```{r}
+ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool <- prune_samples(sample_sums(ps_dada2_not_chloro_mito_decontam_blanks_singletons_wspc_pseudo_pool)>2000, ps_dada2_not_chloro_mito_decontam_blanks_singletons_wspc_pseudo_pool)
+
+# save the processed data as multiple csv files
+write.csv(as.data.frame(otu_table(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool)), "otu_table_wspc2_pseudo_pool.csv")
+write.csv(as.data.frame(tax_table(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool)), "tax_table_wspc2_pseudo_pool.csv")
+write.csv(as.data.frame(sample_data(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool)), "sample_data_wspc2_pseudo_pool.csv")
+
+
+
+# save the final phyloseq object to be able to reload it later
+saveRDS(ps_dada2_not_chloro_mito_decontam_blanks_singletons_lowreads_wspc_pseudo_pool, "cleaned_phyloseq_pseudo_pool.rds")
+```
+
+
+# Tax4Fun Processing 
+##Use different version of SILVA database for use with Tax4Fun
+
+
+
+### Need to get new Silva 123 taxonomy joined and filtered
+```{r}
+silva_123_file <- paste0(database_dir, "silva_nr_v123_train_set.fa.gz")
+
+taxa_for_tax4fun <- assignTaxonomy(seqtab.nochim_pseudo_pool, refFasta = silva_123_file,
+                                   minBoot = 70, outputBootstraps = TRUE, verbose = TRUE, multithread = TRUE)
+
+silva_species_123 <- paste0(database_dir, "silva_species_assignment_v123.fa.gz")
+
+taxa_tax4fun_wspc <- addSpecies(taxa_for_tax4fun[["tax"]], refFasta =  silva_species_123)
+
+
+tax4fun_seqtab <- taxa_tax4fun_wspc %>% as.data.frame() %>%
+  bind_cols(seqtab.nochim_trans_pseudo_pool)
+
+unique(tax4fun_seqtab$Phylum)
+
+write_tsv(tax4fun_seqtab, str_c(dada2_dir, "OTU_table_tax4fun.tsv"))
+
+rownames(tax4fun_seqtab)<-tax4fun_seqtab$OTUNumber
+```
+
+### Remove chloroplasts and mitochondria
+```{r}
+tax4fun_not_chloro_mito <- tax4fun_seqtab %>% filter(is.na(Class) | Class != "Chloroplast", 
+                                                     is.na(Family) | Family != "Mitochondria") 
+
+```
+
+### Make Phyloseq Object 
+```{r}
+OTU <- tax4fun_not_chloro_mito %>% select_if(is.numeric) %>% as.matrix() %>% otu_table(taxa_are_rows = TRUE)
+
+TAX <- tax4fun_not_chloro_mito %>% select(Kingdom:Species) %>%
+  as.matrix() %>% tax_table()
+
+regexp <- "[[:digit:]]+"
+
+
+sampledata <- data.frame(month = ifelse(grepl("Blank", sample_names(OTU)), NA, str_extract(sample_names(OTU), regexp)),
+                         station = ifelse(grepl("Blank", sample_names(OTU)), NA, substr(sample_names(OTU), 3, 7)),
+                         Sample_or_Control = ifelse(grepl("Blank", sample_names(OTU)), "Control Sample", "True Sample"),
+                         row.names = sample_names(OTU),
+                         stringsAsFactors=FALSE) %>% 
+  mutate(Transect = factor(station, levels = c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River"))) %>% 
+  sample_data()
+
+tax4fun_not_chloro_mito_ps <- phyloseq(OTU, TAX, sampledata)
+```
+
+### Remove the contaminant 
+As identified above -  won't have changed with the new taxonomic assignment 
+```{r}
+badTaxa = c("OTU_04506")
+goodTaxa <- setdiff(taxa_names(tax4fun_not_chloro_mito_ps), badTaxa)
+tax4fun_not_chloro_mito_ps_decontam <- prune_taxa(goodTaxa, tax4fun_not_chloro_mito_ps)
+```
+
+
+### Remove blanks
+```{r}
+tax4fun_not_chloro_mito_ps_decontam_blanks <- subset_samples(tax4fun_not_chloro_mito_ps_decontam, Sample_or_Control == "True Sample")
+```
+
+### Remove singletons
+```{r}
+wh0 <- genefilter_sample(tax4fun_not_chloro_mito_ps_decontam_blanks, 
+                         filterfun_sample(function(x) x > 1),
+                         A=2)
+
+tax4fun_not_chloro_mito_ps_decontam_blanks_singletons <- prune_taxa(wh0, tax4fun_not_chloro_mito_ps_decontam_blanks)
+
+
+tax4fun_not_chloro_mito_ps_decontam_blanks_singletons_lowreads <- prune_samples(sample_sums(tax4fun_not_chloro_mito_ps_decontam_blanks_singletons)>2000, tax4fun_not_chloro_mito_ps_decontam_blanks_singletons)
+
+tax4fun_proportions <- transform(tax4fun_not_chloro_mito_ps_decontam_blanks_singletons_lowreads, transform = "compositional")
+
+```
+
+### Load SILVA databse to figure out how to name rows
+```{r}
+SilvaIDs <- readRDS("DNA/tax4fun/SILVA123/SilvaIDs.RData")
+
+SilvaIDs[8367,] 
+```
+So this format is what we need to put as row names rather than the OTU numbers 
+
+### Getting the format Tax4Fun wants
+```{r}
+taxa_4fun <- tax_table(tax4fun_proportions) %>% as.data.frame() %>% 
+  replace_na(list(Class="", Order="",Family="", Genus="")) %>% 
+  mutate(Species = ifelse(is.na(Species), "", paste(Genus, Species, sep = " ")), 
+         all = paste(Kingdom, Phylum, Class, Order, Family, Genus, Species, sep = ";"), 
+         all = paste(all, ";", sep=""),
+         all = str_replace(all, ";;", ";"), 
+         all = str_replace(all, ";;", ";"),
+         all = str_replace(all, ";;", ";"), 
+         all = str_replace(all, ";;", ";"),
+         all = str_replace(all, ";;", ";")) %>% 
+  select(all)
+
+# check to make sure bind_cols will work below
+identical(rownames(taxa_4fun), rownames(otu_table(tax4fun_proportions)))
+
+tax4fun_otu <- otu_table(tax4fun_proportions) %>% 
+  as.data.frame() %>% 
+  bind_cols(taxa_4fun) %>% 
+  group_by(all) %>% 
+  summarise_if(is.numeric, sum) %>% 
+  column_to_rownames(var="all")
+
+```
+So, `otu_stand` now has the correct rownames (full taxonomy), with proportional counts collapsed by the rowname
+
+
+### Make the list that we will give to Tax4Fun
+```{r}
+list_tax4Fun <- list(sampleNames = as.character(sample_names(tax4fun_proportions)),
+otuTable = tax4fun_otu)
+```
+
+
+## Running Tax4Fun
+
+### KEGG orthologs
+```{r}
+library("Tax4Fun")
+
+Tax4Fun.output <- Tax4Fun(list_tax4Fun,
+                        "tax4fun/SILVA123",
+                        fctProfiling = TRUE, # using  the  pre-computed KEGG Ortholog reference profiles
+                        refProfile = "UProC", # method for pre-computing reference profiles
+                        shortReadMode = FALSE, # computation based on 400 bp reads
+                        normCopyNo = TRUE) # adjust for rRNA gene copy number)
+```
+
+
+```{r, eval = FALSE}
+KOs <- t(Tax4Fun.output$Tax4FunProfile) * 100
+head(KOs[order(rowSums(KOs), decreasing = T), ]) # check how it's looking
+```
+
+### Metabolic pathways
+```{r, eval = FALSE}
+Tax4Fun.output.2 <- Tax4Fun(list_tax4Fun,
+                        "tax4fun/SILVA123",
+                        fctProfiling = FALSE, # using  the  pre-computed KEGG Pathway reference profiles
+                        refProfile = "UProC", # method for pre-computing reference profiles
+                        shortReadMode = FALSE, # computation based on 400 bp reads
+                        normCopyNo = TRUE) # adjust for rRNA gene copy number)
+```
+
+
+```{r, eval = FALSE}
+MetaboPath <- t(Tax4Fun.output.2$Tax4FunProfile) * 100
+head(MetaboPath[order(rowSums(MetaboPath), decreasing = T), ])
+```
+
+
+```{r}
+write.csv(MetaboPath, "tax4fun/MetaboPath_redo.csv")
+
+write.csv(KOs, "tax4fun/KOs_redo.csv")
+KOs <- read_csv("tax4fun/KOs_redo.csv") %>% column_to_rownames(var = "...1")
+```
+
+
+
+
+# Clean and join environmental data
+```{r}
+# Load in the individual files for each analysis
+
+# Grain Size
+Dry_weights <- read_csv("/Users/elliehandler/Desktop/Desktop/Norway/Research/Thesis_Data/FINAL Sediment environmental data/Grain Size dry weight.csv")
+Bottle_weights <- read_csv("/Users/elliehandler/Desktop/Desktop/Norway/Research/Thesis_Data/FINAL Sediment environmental data/Grain Size bottle weight.csv")
+
+Porewater <- read_csv("/Users/elliehandler/Desktop/Desktop/Norway/Research/Thesis_Data/FINAL Sediment environmental data/Porewater.csv") %>% select(1,7) 
+
+Tau <- 1.932
+Rb_Ra <- 2.074
+Fd <- 0.57
+
+Sediment_chl <- read_csv("/Users/elliehandler/Desktop/Desktop/Norway/Research/Thesis_Data/FINAL Sediment environmental data/Sediment chl-a.csv") %>% 
+  rename("Sample_Code" = "Sample") 
+
+Sediment_field_book <- read_csv("FINAL Sediment environmental data/Sediment field book.csv") %>% 
+  mutate(Date = dmy(Date), 
+         Time = hms(Time))
+
+Sediment_LOI <- read_csv("FINAL Sediment environmental data/Sediment LOI.csv") %>% 
+  select(1:8) %>% 
+  rename("Sample_Code" = "Sample Code")
+
+Sediment_Porosity <- read_csv("FINAL Sediment environmental data/Sediment Porosity.csv", 
+    skip = 2) %>% rename("Sample_Code" = "Sample Code") %>% dplyr::select(1:8) 
+
+Porewater_nutrients <- read_csv("~/Desktop/Desktop/Norway/Research/Thesis_Data/FINAL Sediment environmental data/FreshFate_nutrients.csv") %>% 
+  mutate(water_type = ifelse(grepl("_x|_y|_z|_e", ID), 
+                             "Porewater", "Adjacent_water"), 
+         water_type = ifelse(grepl("Adventelva", ID), "Adjacent_water", water_type), 
+         acid_state = ifelse(grepl("Neutralized", ID), "Neutralized", "Acidified"), 
+         Site = ifelse(water_type == "Porewater", ifelse(grepl("z", ID), "z", NA), NA), 
+         Site = ifelse(water_type == "Porewater", ifelse(grepl("y", ID), "y", Site), NA),
+         Site = ifelse(water_type == "Porewater", ifelse(grepl("x", ID), "x", Site), NA), 
+         Site = ifelse(water_type == "Porewater", ifelse(grepl("extra", ID), "extra", Site), NA)) %>% 
+  filter(water_type == "Porewater") %>% 
+  select(-c(1,2,4:6)) %>% 
+  mutate(Station = factor(Station,levels = c("A2","Delta_rim", "Shelf", "River"), labels = c("Fjord", "Delta", "Shelf", "River"))) %>% 
+  pivot_longer(cols = c(Ammonium, Phosphate, Nitrite_Nitrate, Silicate), values_to = "Values", names_to = "Variable") %>% 
+  pivot_wider(names_from = c(acid_state), 
+              values_from = Values) %>% 
+  mutate(Vals = ifelse(is.na(Acidified), Neutralized, Acidified), 
+         acid_state = ifelse(is.na(Acidified), "Neutralized","Acidified")) %>% 
+  select(-c(Neutralized, Acidified, water_type))%>% 
+  pivot_wider(names_from = Variable, names_prefix = "PW_", values_from = Vals) %>% 
+  mutate(PW_Ammonium_mol = PW_Ammonium/14.007, 
+         PW_Phosphate_mol = PW_Phosphate/30.9734, 
+         PW_Nitrite_Nitrate_mol = PW_Nitrite_Nitrate/14.007, 
+         PW_Silicate_mol = PW_Silicate/ 28.085)
+
+
+water_station_data <- read_csv("FINAL Sediment environmental data/Water_station_data.csv") %>% filter(grepl(".water", Sample_Code)) %>% 
+  mutate(Ammonium_mol = Ammonium/14.007, 
+         Phosphate_mol = Phosphate/30.9734, 
+         Nitrite_Nitrate_mol = Nitrite_Nitrate/14.007, 
+         Silicate_mol = Silicate/ 28.085)
+
+
+Abs_metrics <- read_csv("/Users/elliehandler/Desktop/Desktop/Norway/Research/Thesis_Data/FINAL Sediment environmental data/DOM_Abs_metrics.csv")
+
+PW_DOM <- Abs_metrics %>% filter(Type == "Porewater") %>% mutate(Sample_Code = str_replace_all(Sample_Code, "A2", "F"))
+
+Adj_DOM <- Abs_metrics %>% filter(grepl(".water",Sample_Code))
+
+PW_pH <- read_csv("FINAL Sediment environmental data/Nutrient_pH.csv")
+
+```
+
+### Calculate values from raw numbers
+```{r}
+# Grain Size
+## Now need to transform grain size data to get the actual percentages for each sample for each size fraction
+Grain_Size <- full_join(Dry_weights, Bottle_weights) %>% 
+  mutate(Dry_weight = `Dry weight with bottle (g)` - `Bottle weight (g)`, 
+         Dry_weight = ifelse(is.na(Dry_weight), 0, Dry_weight), 
+         Dry_weight = ifelse(Dry_weight<0, 0, Dry_weight)) %>% 
+  drop_na(Sample)
+Total_weights <- Grain_Size %>% group_by(Sample) %>% summarise(Total_weight = sum(Dry_weight))
+Grain_Size <- full_join(Grain_Size, Total_weights) %>% 
+  mutate(Percentage = Dry_weight / Total_weight * 100)
+
+Grain_size_wide <- Grain_Size %>% dplyr::select(c(2,3,11)) %>% 
+  pivot_wider(names_from = "Size Fraction", values_from = "Percentage") %>% 
+  rename("Sample_Code" = "Sample")
+
+Grain_Size <-  Grain_Size %>% mutate(Month = if_else(grepl(5, Sample), "May", "blank"), 
+         Month = if_else(grepl(6, Sample), "June", Month), 
+         Month = if_else(grepl(7, Sample), "July", Month), 
+         Month = if_else(grepl(8, Sample), "August", Month), 
+         Month = if_else(grepl(9, Sample), "September", Month),
+         Transect = if_else(grepl("R", Sample), "River", "blank"), 
+         Transect = if_else(grepl("S", Sample), "Intertidal", Transect), 
+         Transect = if_else(grepl("D", Sample), "Subtidal", Transect), 
+         Transect = if_else(grepl("F", Sample), "Fjord", Transect), 
+         Site = if_else(grepl("x", Sample), "x", "blank"), 
+         Site = if_else(grepl("y", Sample), "y", Site), 
+         Site = if_else(grepl("z", Sample), "z", Site), 
+         Site = if_else(grepl("e", Sample), "extra", Site))
+Grain_Size$Month <- factor(Grain_Size$Month, levels = c("May", "June", "July", "August", "September"))
+Grain_Size$Transect <- factor(Grain_Size$Transect, levels = c("Fjord", "Subtidal", "Intertidal", "River"))
+Grain_Size$`Size Fraction` <- factor(Grain_Size$`Size Fraction`, levels = c(">2mm", "1-2mm", "500µm-1mm", "250-500µm", "125-250µm", "63-125µm", "<63µm"))
+levels(Grain_Size$`Size Fraction`) <- c(">2mm (Gravel)", "1-2mm (Very coarse sand)", "500µm-1mm (Coarse sand)", "250-500µm (Medium sand)", "125-250µm (Fine sand)", "63-125µm (Very fine sand)", "<63µm (Silt and clay)")
+
+# Porosity 
+## need to get some constants for calculating water density... 
+t <- 5
+psmow <- 999.842594 + 
+  6.793953*10^(-2)*t + 
+  -9.095290*10^(-3)*t^2 + 
+  1.001685*10^(-4)*t^3 + 
+  -1.120083*10^(-6)*t^4 +
+  6.536332*10^(-9)*t^4
+
+B1 <- 8.2449*10^(-1) +
+  -4.0899*10^(-3)*t +
+  7.6438*10^(-5)*t^2 +
+  -8.2467*10^(-7)*t^3+
+  5.3875*10^(-9)*t^4
+
+C1 <- -5.7246*10^(-3) + 
+  1.0227*10^(-4)*t +
+  -1.6546*10^(-6)*t^2
+
+d0 <- 4.8314*10^(-4)
+
+## Now actually doing the calculations
+Sediment_Porosity <- Sediment_Porosity %>% full_join(Porewater) %>% 
+  mutate(Wet_weight = `Bottle with wet sediments` - `Bottle weight`, 
+         Dry_weight = `Bottle with dry sediments` - `Bottle weight`, 
+         Water_weight = `Wet_weight` - `Dry_weight`, 
+         Bulk_density= round(`Wet_weight` / 24,3), 
+         Water_density = (psmow + B1*Salinity + C1*Salinity^1.5 + d0*Salinity^2)/1000, 
+         Water_volume = `Water_weight`/Water_density, 
+         Porosity = Water_volume / 24)
+
+
+# LOI
+Sediment_LOI <- Sediment_LOI %>% 
+  mutate(Dry_weight = `Crucible + dry sediment (g)`- `Crucible weight (g)`, 
+         Burned_weight = `Crucible + burned sediment (g)` - `Crucible weight (g)`, 
+         Lost_weight = Dry_weight - Burned_weight, 
+         LOI_percent = round(Lost_weight/Dry_weight*100, 3))
+
+# Chlorophyll-a and phaeopigments
+Sediment_chl <- Sediment_chl %>% 
+  mutate(Sample_Code = str_replace_all(Sample_Code, "A2", "F"), 
+         `Chla (mg/m3)` = Fd*Tau*((Rb*`Dilution Factor`)-(Ra*`Dilution Factor`))*10/`Spoon volume (mL)`,
+         Phaeo = Fd*Tau*((Rb_Ra*(Ra*`Dilution Factor`))-(Rb*`Dilution Factor`))*10/`Spoon volume (mL)`,
+         Phaeo = ifelse(Phaeo<0, 0, Phaeo),
+         `% Phaeo` = Phaeo / (`Chla (mg/m3)`+Phaeo))
+
+
+```
+
+
+### Join everything up, keeping only the actual values at the end! 
+```{r}
+sediment_environmental <- full_join(Sediment_Porosity[, -c(5:12,14,15)], Sediment_LOI[,c(1:4,12)]) %>%
+  full_join(Sediment_chl[,c(1,7,8,9)]) %>% 
+  full_join(Grain_size_wide) %>% 
+  full_join(Porewater) %>% 
+  full_join(Porewater_nutrients) %>% 
+  full_join(PW_DOM) %>% 
+  select(-c(Date)) %>% 
+  full_join(Sediment_field_book[,-c(3,4,11,12,14)], by="Sample_Code") %>%
+  drop_na(Month) %>% #removes rows without data  --  Two samples had two grabs, one for sediments, one for porewater. I am keeping only the info for sediment grabs. The MPB sample also had fieldbook info that I do not need for thesis. 
+  mutate(Transect = factor(Station, levels = c("Fjord", "Delta", "Shelf", "River"), labels = c("Fjord", "Subtidal", "Intertidal", "River")),
+         `>250µm` = `250-500µm` + `500µm-1mm` + `1-2mm` +`>2mm`, 
+         `63-250µm` = `63-125µm` + `125-250µm`)
+
+
+adjacent_water_enviro <-full_join(water_station_data, Adj_DOM) %>% 
+  mutate(Transect = factor(Station, levels = c("SeawaterLab","A2", "Delta_rim", "Shelf", "River"), labels = c("SeawaterLab","Fjord", "Subtidal", "Intertidal", "River")))
+```
+
+### Save the new files for use later 
+```{r}
+write_csv(sediment_environmental, "Sediment_Environmental_Data.csv") 
+write_csv(adjacent_water_enviro, "adjacent_water_enviro.csv")
+write_csv(Grain_Size, "grain_size_long.csv")
+```
+
