@@ -1,4 +1,4 @@
-# R scripts for processing and analysis of 16S amplicon data, Biolog EcoPlate data, and corresponding environmental data
+# R scripts for processing and analysis of 16S amplicon sequences, Biolog EcoPlates, and environmental data
 This respository contails R scripts for sequence processing and analysis of 16S amplicon data, Biolog EcoPlate data, and corresponding environmental data from a High Arctic tidal flat.
 
 ## Manuscript_Script_Cleaned.Rmd
