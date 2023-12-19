@@ -1,5 +1,5 @@
-# Arctic-tidalflat-16S
-R scripts for sequence processing and analysis of 16S amplicon data, Biolog EcoPlate data, and corresponding environmental data. 
+# R scripts for processing and analysis of 16S amplicon data, Biolog EcoPlate data, and corresponding environmental data
+This respository contails R scripts for sequence processing and analysis of 16S amplicon data, Biolog EcoPlate data, and corresponding environmental data from a High Arctic tidal flat.
 
 ## Manuscript_Script_Cleaned.Rmd
 This script is for processing 16S amplicon data with DADA2 to generate an ASV table, filtering with phyloseq, inferring functions with Tax4Fun, and processing environmental data. Tables produced are used for plotting in `Manuscript_Plots.Rmd`. 
