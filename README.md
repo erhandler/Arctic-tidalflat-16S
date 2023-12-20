@@ -16,6 +16,6 @@ This script is for producing all the plots and statistical analyses in "Seasonal
 
 :exclamation: These files are optimized for the studied environmental system and are dependant on metadata of the system. The scripts are meant for replication of the following published study: <https://doi.org/10.1093/femsec/fiad162>
 
-:dna: The original sequencing data will be archived at the European Nucleotide Archive. The processed tables (output of Manuscript_Script_Cleaned.Rmd and Plate_Processing_Cleaned.Rmd) will be made available on Dataverse.
+:dna: The original sequencing data has been archived at NCBI's Sequence Read Archive under BioProject accession PRJNA1054200. The processed tables (output of Manuscript_Script_Cleaned.Rmd and Plate_Processing_Cleaned.Rmd) are available at the Northeastern University Digital Repository Service: <http://hdl.handle.net/2047/D20621103>.
 
 :question: Please let me know if you encounter any problems or have any questions.
